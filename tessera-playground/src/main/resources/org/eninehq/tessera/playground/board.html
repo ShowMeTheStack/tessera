@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tessera Playground</title>
+<style>
+  :root { --bg: #f6f7fb; --panel: #ffffff; --ink: #1d2433; --muted: #5d6779; --line: #d9deea; --accent: #2f6fed;
+          --led-off: #3a2422; --led-on: #ff4b3e; --seg-off: #e7e9ef; --seg-on: #e5383b; --btn: #eef1f8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11151d; --panel: #1a202b; --ink: #e8edf6; --muted: #9aa6b8;
+          --line: #2c3545; --accent: #6ea0ff; --led-off: #3b1f1d; --seg-off: #262c38; --btn: #232b39; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 18px; margin: 0 12px 0 0; }
+  header .msg { color: var(--muted); flex: 1; min-width: 200px; }
+  button, a.btn { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--btn); color: var(--ink); cursor: pointer; text-decoration: none; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
+  .group { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  .group .label { font-size: 12px; color: var(--muted); }
+  .bits { display: flex; gap: 8px; flex-direction: row-reverse; }
+  .led { width: 26px; height: 26px; border-radius: 50%; background: var(--led-off); border: 2px solid var(--line); transition: background .05s; }
+  .led.on { background: var(--led-on); box-shadow: 0 0 14px var(--led-on); }
+  .push { width: 46px; height: 46px; border-radius: 50%; font-weight: 600; }
+  .push.down { background: var(--accent); color: #fff; }
+  .switch { width: 30px; height: 52px; border-radius: 8px; position: relative; padding: 0; }
+  .switch::after { content: ""; position: absolute; left: 4px; right: 4px; height: 20px; top: 26px; border-radius: 5px; background: var(--muted); transition: top .1s; }
+  .switch.on::after { top: 4px; background: var(--accent); }
+  .num { font: 600 18px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  input.numin { width: 120px; font: inherit; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  svg.seg .s { fill: var(--seg-off); } svg.seg .s.on { fill: var(--seg-on); }
+  .wave svg { width: 100%; height: auto; }
+  .diagram img { width: 100%; height: auto; background: var(--bg); border-radius: 8px; }
+  .meta { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tessera Playground</h1>
+  <span class="msg" id="msg">connecting…</span>
+  <button id="reset">Reset</button>
+  <button id="reload" title="Recompile the Java sources and continue from the current state">Reload code</button>
+  
+  <a class="btn" href="/design.sv" target="_blank">SystemVerilog</a>
+</header>
+<main>
+  <section><h2>Board</h2><div class="row" id="outputs"></div></section>
+  <section><h2>Controls</h2><div class="row" id="inputs"></div></section>
+  <section class="wave"><h2>Waveform (last 120 frames)</h2><svg id="wave" viewBox="0 0 960 40"></svg></section>
+  <section class="diagram"><h2>Block diagram</h2><img id="diagram" alt="block diagram of the design" src="/diagram.svg"></section>
+  <section class="meta" id="meta"></section>
+</main>
+<script>
+const SEG = { a: "M10,4 h40 l-6,6 h-28z", b: "M51,6 v38 l-6,-4 v-28z", c: "M51,56 v38 l-6,-6 v-28z", d: "M10,96 h40 l-6,-6 h-28z",
+              e: "M9,56 v38 l6,-6 v-28z", f: "M9,6 v38 l6,-4 v-28z", g: "M12,50 l6,-5 h24 l6,5 l-6,5 h-24z" };
+const HEX = [0x3f,0x06,0x5b,0x4f,0x66,0x6d,0x7d,0x07,0x7f,0x6f,0x77,0x7c,0x39,0x5e,0x79,0x71];
+const history = [];
+let built = "";
+function bit(v, i) { return (BigInt("0x" + v) >> BigInt(i)) & 1n; }
+function segSvg(mask) {
+  let s = '<svg class="seg" width="40" height="66" viewBox="0 0 60 100">';
+  "abcdefg".split("").forEach((k, i) => s += `<path class="s${(mask >> i) & 1 ? " on" : ""}" d="${SEG[k]}"/>`);
+  return s + "</svg>";
+}
+function poke(name, value) { fetch(`/input?name=${encodeURIComponent(name)}&value=${value}`, {method: "POST"}); }
+const values = {};
+function build(state) {
+  const outs = document.getElementById("outputs"), ins = document.getElementById("inputs");
+  outs.innerHTML = ""; ins.innerHTML = "";
+  for (const p of state.ports) {
+    const g = document.createElement("div"); g.className = "group"; g.id = "g-" + p.name;
+    const label = `<div class="label">${p.name}${p.width > 1 ? " [" + p.width + "]" : ""}</div>`;
+    if (p.dir === "out") {
+      if (p.kind === "led") g.innerHTML = `<div class="bits">${Array.from({length: p.width}, (_, i) => `<div class="led" data-bit="${i}"></div>`).join("")}</div>` + label;
+      else if (p.kind === "seg" || p.kind === "hex") g.innerHTML = `<div class="bits disp"></div>` + label;
+      else g.innerHTML = `<div class="num">0</div>` + label;
+      outs.appendChild(g);
+    } else {
+      values[p.name] = 0n;
+      if (p.kind === "button" || p.kind === "switch") {
+        const bits = document.createElement("div"); bits.className = "bits";
+        for (let i = 0; i < p.width; i++) {
+          const b = document.createElement("button");
+          b.className = p.kind === "button" ? "push" : "switch";
+          b.setAttribute("aria-label", `${p.name} bit ${i}`);
+          if (p.kind === "button") {
+            b.textContent = p.width > 1 ? i : "";
+            const set = on => { values[p.name] = on ? values[p.name] | (1n << BigInt(i)) : values[p.name] & ~(1n << BigInt(i)); b.classList.toggle("down", on); poke(p.name, values[p.name]); };
+            b.addEventListener("pointerdown", () => set(true)); b.addEventListener("pointerup", () => set(false)); b.addEventListener("pointerleave", () => b.classList.contains("down") && set(false));
+          } else {
+            b.addEventListener("click", () => { values[p.name] ^= (1n << BigInt(i)); b.classList.toggle("on"); poke(p.name, values[p.name]); });
+          }
+          bits.appendChild(b);
+        }
+        g.appendChild(bits); g.insertAdjacentHTML("beforeend", label);
+      } else {
+        g.innerHTML = `<input class="numin" type="number" min="0" value="0">` + label;
+        g.querySelector("input").addEventListener("change", e => poke(p.name, BigInt(e.target.value || 0)));
+      }
+      ins.appendChild(g);
+    }
+  }
+  built = state.design + state.ports.map(p => p.name + p.width).join();
+}
+function update(state) {
+  if (built !== state.design + state.ports.map(p => p.name + p.width).join()) { build(state); document.getElementById("diagram").src = "/diagram.svg?" + Date.now(); }
+  document.getElementById("msg").textContent = `${state.message} — cycle ${state.cycle.toLocaleString()} at ${state.hz.toLocaleString()} Hz`;
+  const frame = [];
+  for (const p of state.ports) {
+    if (p.dir !== "out") continue;
+    const g = document.getElementById("g-" + p.name);
+    if (p.kind === "led") { g.querySelectorAll(".led").forEach(l => l.classList.toggle("on", bit(p.value, l.dataset.bit) === 1n)); for (let i = 0; i < Math.min(p.width, 8); i++) frame.push([p.name + (p.width > 1 ? i : ""), Number(bit(p.value, i))]); }
+    else if (p.kind === "seg") g.querySelector(".disp").innerHTML = segSvg(Number(BigInt("0x" + p.value)));
+    else if (p.kind === "hex") { const v = BigInt("0x" + p.value); let h = ""; for (let d = Math.ceil(p.width / 4) - 1; d >= 0; d--) h += segSvg(HEX[Number((v >> BigInt(4 * d)) & 15n)]); g.querySelector(".disp").innerHTML = h; }
+    else { const v = BigInt("0x" + p.value); g.querySelector(".num").textContent = `${v} (0x${p.value})`; if (p.width === 1) frame.push([p.name, Number(v)]); }
+  }
+  history.push(frame); if (history.length > 120) history.shift();
+  drawWave();
+}
+function drawWave() {
+  const svg = document.getElementById("wave"); if (!history.length) return;
+  const names = history[history.length - 1].map(x => x[0]).slice(0, 12);
+  const rowH = 22, w = 960, left = 90, dx = (w - left) / 120;
+  svg.setAttribute("viewBox", `0 0 ${w} ${Math.max(40, names.length * rowH + 6)}`);
+  let s = "";
+  names.forEach((n, r) => {
+    const y0 = r * rowH + 4, hi = y0 + 2, lo = y0 + rowH - 6;
+    s += `<text x="0" y="${lo}" font-size="12" fill="currentColor">${n}</text>`;
+    let d = "";
+    history.forEach((f, i) => { const v = (f.find(x => x[0] === n) || [n, 0])[1]; const x = left + i * dx, y = v ? hi : lo; d += (i ? `L${x},${y}` : `M${x},${y}`) + `L${x + dx},${y}`; });
+    s += `<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.6"/>`;
+  });
+  svg.innerHTML = s;
+}
+document.getElementById("reset").onclick = () => fetch("/reset", {method: "POST"});
+document.getElementById("reload").onclick = async () => {
+  const r = await (await fetch("/reload", {method: "POST"})).json();
+  if (r.ok) return;
+  if (r.error.includes('"fixes": [{') && confirm(r.error.split("\n")[0] + "\n\nApply the suggested fix to your code?")) {
+    const f = await (await fetch("/fix", {method: "POST"})).json();
+    if (!f.ok) alert(f.error);
+  } else alert(r.error);
+};
+const es = new EventSource("/events");
+es.onmessage = e => update(JSON.parse(e.data));
+es.onerror = () => document.getElementById("msg").textContent = "disconnected";
+fetch("/state").then(r => r.json()).then(update);
+document.getElementById("meta").textContent = "Ports named led*, btn*, sw*, seg* (7 bits) and hex* (4 bits per digit) appear as LEDs, buttons, switches and displays.";
+</script>
+</body>
+</html>

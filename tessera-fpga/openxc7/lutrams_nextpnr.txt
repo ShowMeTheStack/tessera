@@ -1,0 +1,76 @@
+# yosys 0.52 share/xilinx/lutrams_xc5v.txt without the single-port RAMs (RAM64X1S..RAM512X1S),
+# which nextpnr-xilinx cannot pack; used by build.sh for the memories named in LUTRAM_MEMS.
+# LUT RAMs for Virtex 5, Virtex 6, Spartan 6, Series 7.
+# The corresponding mapping file is lutrams_xc5v_map.v
+
+# Single-port RAMs.
+
+# Dual-port RAMs.
+
+ram distributed $__XILINX_LUTRAM_DP_ {
+	cost 8;
+	widthscale;
+	option "ABITS" 5 {
+		abits 5;
+		widths 4 global;
+	}
+	option "ABITS" 6 {
+		abits 6;
+		widths 2 global;
+	}
+	option "ABITS" 7 {
+		abits 7;
+		widths 1 global;
+	}
+	init no_undef;
+	prune_rom;
+	port arsw "RW" {
+		clock posedge;
+	}
+	port ar "R" {
+	}
+}
+
+# Quad-port RAMs.
+
+ram distributed $__XILINX_LUTRAM_QP_ {
+	cost 7;
+	widthscale;
+	option "ABITS" 5 {
+		abits 5;
+		widths 2 global;
+	}
+	option "ABITS" 6 {
+		abits 6;
+		widths 1 global;
+	}
+	init no_undef;
+	prune_rom;
+	port arsw "RW" {
+		clock posedge;
+	}
+	port ar "R0" "R1" "R2" {
+	}
+}
+
+# Simple dual port RAMs.
+
+ram distributed $__XILINX_LUTRAM_SDP_ {
+	cost 8;
+	widthscale 7;
+	option "ABITS" 5 {
+		abits 5;
+		widths 6 global;
+	}
+	option "ABITS" 6 {
+		abits 6;
+		widths 3 global;
+	}
+	init no_undef;
+	prune_rom;
+	port sw "W" {
+		clock posedge;
+	}
+	port ar "R" {
+	}
+}

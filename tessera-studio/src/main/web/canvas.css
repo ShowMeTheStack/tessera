@@ -1,0 +1,136 @@
+/* The schematic canvas: paper, dot grid, parts, wires coloured by value, transient UI. */
+.cv {
+  position: relative; flex: 1; min-height: 0; overflow: hidden; outline: none;
+  background-color: var(--paper);
+  background-image: radial-gradient(var(--grid) 1.1px, transparent 1.25px);
+  touch-action: none; cursor: default;
+}
+.cv:focus-visible { box-shadow: inset 0 0 0 2px var(--accent-soft); }
+.cv.on-pin { cursor: crosshair; }
+.cv.panning { cursor: grab; }
+.cv-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.cv-tags { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.cv-empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
+.cv-empty svg.ic { width: 34px; height: 34px; color: var(--faint); }
+.cv-zoom { position: absolute; top: 10px; right: 10px; display: grid; gap: 4px; }
+.cv-zoom .btn { background: var(--panel); }
+.cv-mini { position: absolute; right: 10px; bottom: 10px; width: 170px; height: 108px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); opacity: .92; cursor: pointer; }
+.cv-mini .mm-part { fill: var(--line2); }
+.cv-mini .mm-view { fill: color-mix(in srgb, var(--accent) 14%, transparent); stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+
+/* parts */
+.part { cursor: move; }
+.part .body { fill: var(--part); stroke: var(--part-line); stroke-width: 1.6; }
+.part .body-line { fill: none; stroke: var(--part-line); stroke-width: 1.6; }
+.part .lead { fill: none; stroke: var(--part-line); stroke-width: 1.6; }
+.part .glyph { fill: none; stroke: var(--glyph); stroke-width: 1.5; stroke-linejoin: round; }
+.part text { fill: var(--part-text); font: 500 11px var(--font); user-select: none; }
+.part .pin-label { fill: var(--pin-text); font-size: 11px; }
+.part .pin-w { fill: var(--pin-text); font: 600 11px var(--mono); }
+.part .box-title { font: 600 12px var(--font); }
+.part .box-title.head { font: 500 11px var(--mono); fill: var(--glyph); }
+.part .body-line.head { stroke-width: 1; opacity: .6; }
+.part .op-text { font: 700 12px var(--mono); }
+.part .const-text { font: 600 11px var(--mono); }
+.part .part-name { fill: var(--muted); font: italic 500 11px var(--font); }
+.part .reg-val { fill: var(--vbus); font: 700 11px var(--mono); }
+.part .check-assert { stroke: var(--c3); }
+.part .check-assume { stroke: var(--c4); }
+.part .check-cover { stroke: var(--c5); }
+.part.failing .body { stroke: var(--bad); fill: var(--bad-soft); }
+.part .port-flag { fill: var(--port); stroke: var(--port-line); stroke-width: 1.6; }
+.part .port-name { font: 600 11.5px var(--font); fill: var(--part-text); }
+.part.lv1 .port-flag { fill: color-mix(in srgb, var(--v1) 28%, var(--part)); stroke: var(--v1); }
+.part.lv0 .port-flag { stroke: var(--v0); }
+.part.sel .body, .part.sel .body-line, .part.sel .lead, .part.sel .port-flag { stroke: var(--sel); }
+.part.err .body, .part.err .port-flag, .part.err .lead { stroke: var(--bad); }
+.part.warn .body, .part.warn .port-flag { stroke: var(--warn); }
+.cv.far .part .pin-label, .cv.far .part .pin-w { display: none; }
+
+/* wires */
+.wire { fill: none; stroke: var(--wire); stroke-width: 1.7; stroke-linecap: square; stroke-linejoin: miter; }
+.wire.bus { stroke-width: 3.6; }
+.wire.v0 { stroke: var(--v0); }
+.wire.v1 { stroke: var(--v1); }
+.wire.vbus { stroke: var(--vbus); }
+.wire.sel { stroke: var(--sel) !important; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--sel) 60%, transparent)); }
+.wire.loose { stroke: var(--bad); stroke-dasharray: 3 4; }
+.wire.logic { stroke: var(--faint); stroke-dasharray: 5 3; stroke-width: 1.3; }
+.wire.flash { animation: wflash .45s ease-out; }
+@keyframes wflash { from { stroke-width: 5.5; stroke: var(--vchg); } }
+.dot { fill: var(--wire); }
+.dot.v0 { fill: var(--v0); } .dot.v1 { fill: var(--v1); } .dot.vbus { fill: var(--vbus); }
+.slash { stroke: var(--wire); stroke-width: 1.4; }
+.wire-w { fill: var(--pin-text); font: 600 11px var(--mono); }
+.net-name { fill: var(--muted); font: italic 500 11px var(--font); }
+
+/* transient */
+.selbox { pointer-events: none; fill: color-mix(in srgb, var(--sel) 7%, transparent); stroke: var(--sel); stroke-width: 1.2; stroke-dasharray: 4 3; }
+.pinhot { fill: var(--accent); stroke: var(--paper); stroke-width: 1.5; }
+.ghost { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-dasharray: 6 4; }
+.ghost.on { stroke-dasharray: none; stroke-width: 2.4; opacity: .85; }
+.marquee { fill: color-mix(in srgb, var(--accent) 10%, transparent); stroke: var(--accent); stroke-width: 1; stroke-dasharray: 4 3; }
+
+.vtag {
+  position: absolute; left: 0; top: 0; padding: 0 6px; border: 1px solid var(--vbus); border-radius: 5px;
+  background: var(--paper); color: var(--vbus); font: 600 11px/17px var(--mono); white-space: nowrap;
+}
+.vtag.flash { animation: tflash .45s ease-out; }
+@keyframes tflash { from { background: var(--vbus); color: var(--paper); } }
+.part .block-edge { opacity: .35; stroke-dasharray: none; }
+.cv .wire.hover { stroke-width: 3.4; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--sel) 60%, transparent)); }
+.cv .wire.bus.hover { stroke-width: 5.5; }
+.cv .dot.hover { r: 4.6; }
+.cv.net-hover .wire:not(.hover) { opacity: .55; }
+.cv .pinhot.net { fill: none; stroke: var(--sel); stroke-width: 1.5; }
+.cv .via { fill: var(--panel); stroke: var(--sel); stroke-width: 1.5; cursor: move; }
+.cv .via.ghost { fill: var(--sel); opacity: .6; }
+.ghost.kb { stroke: var(--sel); stroke-dasharray: 3 3; }
+.part .reg-next { fill: var(--faint); font: 500 11px var(--mono); }
+.part .reg-val.handover { animation: handover .25s ease-out; }
+@keyframes handover { from { fill: var(--vchg); opacity: .35; } }
+.cv .wire.stall { stroke: var(--warn) !important; stroke-dasharray: 5 3; }
+.cv .wire.beat { animation: beat .5s linear infinite; stroke-dasharray: 8 6; }
+@keyframes beat { to { stroke-dashoffset: -14; } }
+.part .fifo-bg { fill: var(--panel3); }
+.part .fifo-fill { fill: var(--v1); transition: width .15s; }
+.part .fifo-fill.full { fill: var(--warn); }
+.vtag.enum { background: color-mix(in srgb, var(--ev) 25%, var(--panel)); border-color: var(--ev); color: var(--text); font-weight: 600; }
+@media (prefers-reduced-motion: reduce) { .cv .wire.beat { animation: none; } .part .reg-val.handover { animation: none; } }
+/* level of detail: text that would be drawn under 11 px is left out (zoom in to read it). The 11 px text
+   goes below zoom 1, the 11.5 and 12 px titles below 11/12 */
+.cv.lod-small .part text:not(.port-name):not(.box-title):not(.op-text), .cv.lod-small .wire-w, .cv.lod-small .net-name { display: none; }
+.cv.lod-none svg text { display: none; }
+.cv .wire.stream { stroke-width: 5; stroke: var(--vbus); stroke-linecap: round; opacity: .9; }
+.cv .wire.stream.stall { stroke: var(--warn) !important; }
+/* the clock domain of a part that has one of its own */
+.part .dom-tag { fill: var(--c4); }
+/* activity heat (View → Activity heat): quiet to busy over the last 256 cycles; it wins over the value colours */
+.cv .wire.heat0 { stroke: var(--faint); }
+.cv .wire.heat1 { stroke: var(--c5); }
+.cv .wire.heat2 { stroke: var(--c7); }
+.cv .wire.heat3 { stroke: var(--c1); }
+.cv .wire.heat4 { stroke: var(--c3); }
+.cv .dot.heat0 { fill: var(--faint); } .cv .dot.heat1 { fill: var(--c5); } .cv .dot.heat2 { fill: var(--c7); } .cv .dot.heat3 { fill: var(--c1); } .cv .dot.heat4 { fill: var(--c3); }
+.part .iec-q { font: 600 13px var(--mono); fill: var(--text); }
+/* board parts on the drawing: LEDs, switches, push buttons, hex digits */
+.part .board-body { fill: var(--panel2); }
+.part .board-name { font: 600 11px var(--mono); fill: var(--muted); }
+.part .bled { fill: var(--panel); stroke: var(--line2); stroke-width: 1.2; }
+.part .bled.on { fill: var(--c2); stroke: var(--c2); filter: drop-shadow(0 0 4px var(--c2)); }
+.part .bsw rect { fill: var(--panel); stroke: var(--line2); }
+.part .bsw .knob { fill: var(--muted); stroke: none; transition: transform .08s; }
+.part .bsw.on .knob { fill: var(--accent); transform: translateY(0); }
+.part .bsw:not(.on) .knob { transform: translateY(8px); }
+.part .bsw, .part .bbtn { cursor: pointer; }
+.part .bbtn circle { fill: var(--panel); stroke: var(--line2); stroke-width: 1.5; }
+.part .bbtn.on circle { fill: var(--accent); stroke: var(--accent); }
+.part .seg { fill: var(--panel); }
+.part .seg.on { fill: var(--c3); }
+
+/* a timing path's parts (timing.js) */
+.cpmark { pointer-events: none; }
+.cpmark .cpbox { fill: none; stroke: var(--warn); stroke-width: 1.6; }
+.cpmark circle { fill: var(--warn); }
+.cpmark text { fill: #1d1300; font: 700 10px var(--mono); text-anchor: middle; }
+.cpmark text.cpns { fill: var(--warn); text-anchor: start; font-weight: 600; paint-order: stroke; stroke: var(--paper); stroke-width: 3px; }

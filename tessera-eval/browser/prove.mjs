@@ -1,0 +1,33 @@
+// The Prove pane on the counter sample with an assertion that fails: node prove.mjs <url> <outdir>
+import { chromium } from 'playwright';
+const [url, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(url);
+await page.evaluate(() => localStorage.clear());
+await page.reload();
+await page.waitForTimeout(1500);
+await page.evaluate(() => {
+  const app = Studio.app, doc = app.doc;
+  const k = doc.addPart('const', 30, 18, { value: '5', width: 8 });
+  const c = doc.addPart('cmp', 40, 16, { op: 'lt' });
+  const a = doc.addPart('assert', 50, 17, { name: 'below_five' });
+  for (const p of [k, c, a]) p.pins = app.pinsFor(p);
+  doc.reindex();
+  doc.connect({ part: 'p2', pin: 'q' }, { part: c.id, pin: 'a' });
+  doc.connect({ part: k.id, pin: 'y' }, { part: c.id, pin: 'b' });
+  doc.connect({ part: c.id, pin: 'y' }, { part: a.id, pin: 'cond' });
+  S = Studio;
+});
+await page.waitForTimeout(2000);
+await page.locator('.tab[data-tab="prove"]').click();
+await page.locator('button', { hasText: 'Bounded' }).click();
+await page.waitForTimeout(4000);
+await page.screenshot({ path: out + '/prove.png' });
+console.log(await page.locator('.prove-log').innerText());
+console.log((await page.evaluate(() => Studio.app.gen.java)).split('\n').filter((l) => l.includes('Hw.')).join('\n'));
+console.log(errors.length ? errors.join('\n') : 'no console errors');
+await browser.close();

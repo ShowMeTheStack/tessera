@@ -1,0 +1,40 @@
+// The waves dock: select, group, expand a bus, marker. node waves.mjs <url> <outdir>
+import { chromium } from 'playwright';
+const [url, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(url);
+await page.evaluate(() => localStorage.clear());
+await page.reload();
+await page.waitForTimeout(1500);
+await page.evaluate(() => Studio.app.sim({ cmd: 'poke', path: 'en', value: '1' }));
+await page.waitForTimeout(3000);
+const names = page.locator('.wv-name');
+await names.nth(1).click();
+await names.nth(2).click({ modifiers: ['Shift'] });
+await page.locator('.wv-plot').focus();
+await page.keyboard.press('g');
+await page.waitForTimeout(300);
+await page.keyboard.type('counter');
+await page.keyboard.press('Enter');
+await page.waitForTimeout(300);
+// expand "count" into bits
+await page.locator('.wv-name', { hasText: 'count' }).locator('.wv-exp').click();
+await page.waitForTimeout(500);
+// cursor and marker
+const plot = await page.locator('.wv-plot').boundingBox();
+await page.mouse.click(plot.x + plot.width * 0.5, plot.y + 40);
+await page.waitForTimeout(500);
+await page.locator('.wv-plot').focus();
+await page.keyboard.press('m');
+await page.waitForTimeout(200);
+await page.keyboard.press('Enter');
+await page.waitForTimeout(800);
+await page.evaluate(() => { Studio.app.dockH = 520; document.querySelector('.dock').style.height = '520px'; });
+await page.waitForTimeout(600);
+await page.screenshot({ path: out + '/waves.png' });
+console.log(errors.length ? errors.join('\n') : 'no console errors');
+await browser.close();

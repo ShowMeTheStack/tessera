@@ -1,0 +1,1379 @@
+From 6d8ef332ea67627a4246cbe63bcbfff673010c84 Mon Sep 17 00:00:00 2001
+From: Jyotiprakash Mishra <mail@jyotiprakash.org>
+Date: Thu, 22 Oct 2026 18:53:11 +0530
+Subject: [PATCH 1/2] Tessera language extensions: uint/ulong/uint<N>/bits<N>,
+ unsigned literals, slices, concatenation, @Operator overloading, trailing
+ blocks, T<N> widths, automatic local names
+---
+ .../com/sun/tools/javac/code/Type.java        |  49 +-
+ .../com/sun/tools/javac/comp/Attr.java        |  83 ++-
+ .../sun/tools/javac/comp/TesseraSyntax.java   | 635 ++++++++++++++++++
+ .../sun/tools/javac/main/JavaCompiler.java    |   3 +
+ .../sun/tools/javac/parser/JavaTokenizer.java |   3 +
+ .../sun/tools/javac/parser/JavacParser.java   | 180 ++++-
+ .../tools/javac/resources/compiler.properties |   5 +
+ .../com/sun/tools/javac/tree/JCTree.java      |  27 +
+ .../com/sun/tools/javac/tree/TreeCopier.java  |  15 +
+ .../com/sun/tools/javac/tree/TreeScanner.java |   1 +
+ .../sun/tools/javac/tree/TreeTranslator.java  |   1 +
+ 11 files changed, 994 insertions(+), 8 deletions(-)
+ create mode 100644 src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
+
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java
+index fa0220b1e..35978e6a3 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Type.java
+@@ -735,6 +735,53 @@ public <R, P> R accept(TypeVisitor<R, P> v, P p) {
+         throw new AssertionError();
+     }
+ 
++    /**
++     * Tessera: an unsigned integer ({@code uint}, {@code ulong}, {@code uint<N>}) or a raw bit
++     * vector ({@code bits<N>}) of {@code bits} bits. It is an {@code int} (up to 32 bits) or a
++     * {@code long} everywhere outside attribution and lowering, so class files are unchanged.
++     */
++    public static class UnsignedType extends JCPrimitiveType {
++        public final int bits;
++        public final boolean raw;
++        private final UnsignedType canonical;
++
++        public UnsignedType(TypeTag tag, TypeSymbol tsym, int bits, boolean raw) {
++            super(tag, tsym, List.nil());
++            this.bits = bits;
++            this.raw = raw;
++            this.canonical = this;
++        }
++
++        private UnsignedType(UnsignedType canonical, List<TypeMetadata> md) {
++            super(canonical.getTag(), canonical.tsym, md);
++            this.bits = canonical.bits;
++            this.raw = canonical.raw;
++            this.canonical = canonical;
++        }
++
++        @Override
++        protected JCPrimitiveType cloneWithMetadata(List<TypeMetadata> md) {
++            return new UnsignedType(canonical, md);
++        }
++
++        @Override
++        public Type baseType() {
++            return canonical;
++        }
++
++        @Override
++        public String toString() {
++            if (raw) return "bits<" + bits + ">";
++            return switch (bits) {
++                case 8 -> "ubyte";
++                case 16 -> "ushort";
++                case 32 -> "uint";
++                case 64 -> "ulong";
++                default -> "uint<" + bits + ">";
++            };
++        }
++    }
++
+     public static class JCPrimitiveType extends Type
+             implements javax.lang.model.type.PrimitiveType {
+ 
+@@ -744,7 +791,7 @@ public JCPrimitiveType(TypeTag tag, TypeSymbol tsym) {
+             this(tag, tsym, List.nil());
+         }
+ 
+-        private JCPrimitiveType(TypeTag tag, TypeSymbol tsym, List<TypeMetadata> metadata) {
++        protected JCPrimitiveType(TypeTag tag, TypeSymbol tsym, List<TypeMetadata> metadata) {
+             super(tsym, metadata);
+             this.tag = tag;
+             Assert.check(tag.isPrimitive);
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java
+index bc9efa30d..3c565e9e5 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -125,6 +125,8 @@ public class Attr extends JCTree.Visitor {
+     final MatchBindingsComputer matchBindingsComputer;
+     final AttrRecover attrRecover;
+ 
++    final TesseraSyntax tessera;
++
+     public static Attr instance(Context context) {
+         Attr instance = context.get(attrKey);
+         if (instance == null)
+@@ -135,6 +137,7 @@ public static Attr instance(Context context) {
+     @SuppressWarnings("this-escape")
+     protected Attr(Context context) {
+         context.put(attrKey, this);
++        tessera = TesseraSyntax.instance(context);
+ 
+         names = Names.instance(context);
+         log = Log.instance(context);
+@@ -3115,6 +3118,29 @@ public JCExpression makeNullCheck(JCExpression arg) {
+     }
+ 
+     public void visitNewArray(JCNewArray tree) {
++        if (tree.elemtype == null && tree.elems != null && tree.elems.nonEmpty()
++                && (tree instanceof JCConcat || (!pt().hasTag(ARRAY)
++                        && (TesseraSyntax.isUnsigned(pt()) || tessera.operatorMethod(pt(), "{}", false) != null)))) {
++            // Tessera: {a, b} concatenation
++            Type first = attribExpr(tree.elems.head, env);
++            JCExpression opCall = tessera.concatOperatorCall(make, tree, first);
++            if (opCall != null) {
++                Type t = attribExpr(opCall, env);
++                tessera.replace(tree, opCall);
++                result = check(tree, t, KindSelector.VAL, resultInfo);
++                return;
++            }
++            ListBuffer<Type> ts = new ListBuffer<>();
++            ts.append(first);
++            for (List<JCExpression> l = tree.elems.tail; l.nonEmpty(); l = l.tail) ts.append(attribExpr(l.head, env));
++            Type ct = tessera.concatType(tree, ts.toList());
++            if (ct == null) {
++                log.error(tree.pos(), Errors.Tessera("{a, b} needs unsigned values or a type with an @Operator(\"{}\") method"));
++                ct = types.createErrorType(pt());
++            }
++            result = check(tree, ct, KindSelector.VAL, resultInfo);
++            return;
++        }
+         Type owntype = types.createErrorType(tree.type);
+         Env<AttrContext> localEnv = env.dup(tree);
+         Type elemtype;
+@@ -4011,6 +4037,15 @@ public void visitUnary(JCUnary tree) {
+             ? attribTree(tree.arg, env, varAssignmentInfo)
+             : chk.checkNonVoid(tree.arg.pos(), attribExpr(tree.arg, env));
+ 
++        // Tessera: operators on reference types with @Operator methods
++        JCExpression opCall = tessera.unaryOperatorCall(make, tree, argtype);
++        if (opCall != null) {
++            Type t = attribExpr(opCall, env);
++            tessera.replace(tree, opCall);
++            result = check(tree, t, KindSelector.VAL, resultInfo);
++            return;
++        }
++
+         // Find operator.
+         OperatorSymbol operator = tree.operator = operators.resolveUnary(tree, tree.getTag(), argtype);
+         Type owntype = types.createErrorType(tree.type);
+@@ -4020,9 +4055,11 @@ public void visitUnary(JCUnary tree) {
+                 ? tree.arg.type
+                 : operator.type.getReturnType();
+             int opc = operator.opcode;
++            Type unsignedType = tessera.unaryType(tree, argtype);
++            if (unsignedType != null) owntype = tree.getTag().isIncOrDecUnaryOp() ? tree.arg.type : unsignedType;
+ 
+             // If the argument is constant, fold it.
+-            if (argtype.constValue() != null) {
++            if (unsignedType == null && argtype.constValue() != null) {
+                 Type ctype = cfolder.fold1(opc, argtype);
+                 if (ctype != null) {
+                     owntype = cfolder.coerce(ctype, owntype);
+@@ -4065,16 +4102,28 @@ public void visitBinary(JCBinary tree) {
+ 
+         matchBindings = matchBindingsComputer.binary(tree, lhsBindings, matchBindings);
+ 
++        // Tessera: operators on reference types with @Operator methods
++        JCExpression opCall = tessera.binaryOperatorCall(make, tree, left, right);
++        if (opCall != null) {
++            Type t = attribExpr(opCall, env);
++            tessera.replace(tree, opCall);
++            result = check(tree, t, KindSelector.VAL, resultInfo);
++            return;
++        }
++
+         // Find operator.
+         OperatorSymbol operator = tree.operator = operators.resolveBinary(tree, tree.getTag(), left, right);
+         Type owntype = types.createErrorType(tree.type);
++        boolean unsignedOperands = TesseraSyntax.isUnsigned(left) || TesseraSyntax.isUnsigned(right);
+         if (operator != operators.noOpSymbol &&
+                 !left.isErroneous() &&
+                 !right.isErroneous()) {
+             owntype = operator.type.getReturnType();
+             int opc = operator.opcode;
++            Type unsignedType = tessera.binaryType(tree, left, right, owntype);
++            if (unsignedType != null) owntype = unsignedType;
+             // If both arguments are constants, fold them.
+-            if (left.constValue() != null && right.constValue() != null) {
++            if (!unsignedOperands && left.constValue() != null && right.constValue() != null) {
+                 Type ctype = cfolder.fold2(opc, left, right);
+                 if (ctype != null) {
+                     owntype = cfolder.coerce(ctype, owntype);
+@@ -4123,8 +4172,13 @@ public boolean compatible(Type found, Type req, Warner warn) {
+         Type owntype = isPoly ? clazztype : chk.checkCastable(tree.expr.pos(), exprtype, clazztype);
+         if (exprtype.constValue() != null)
+             owntype = cfolder.coerce(exprtype, owntype);
++        boolean unsignedCast = TesseraSyntax.isUnsigned(clazztype) || TesseraSyntax.isUnsigned(exprtype);
++        if (unsignedCast && clazztype.isPrimitive() && !owntype.isErroneous()) {
++            // Tessera: casts to/from unsigned types keep (or drop) unsignedness, and narrow constants
++            owntype = tessera.castConstant(exprtype, clazztype);
++        }
+         result = check(tree, capture(owntype), KindSelector.VAL, resultInfo);
+-        if (!isPoly)
++        if (!isPoly && !unsignedCast)
+             chk.checkRedundantCast(localEnv, tree);
+     }
+ 
+@@ -4316,7 +4370,24 @@ public void visitRecordPattern(JCRecordPattern tree) {
+     public void visitIndexed(JCArrayAccess tree) {
+         Type owntype = types.createErrorType(tree.type);
+         Type atype = attribExpr(tree.indexed, env);
+-        attribExpr(tree.index, env, syms.intType);
++        // Tessera: x[i] / x[hi:lo] on reference types with @Operator("[]") / @Operator("[:]")
++        JCExpression opCall = tessera.indexOperatorCall(make, tree, atype);
++        if (opCall != null) {
++            Type t = attribExpr(opCall, env);
++            tessera.replace(tree, opCall);
++            result = check(tree, t, KindSelector.VAL, resultInfo);
++            return;
++        }
++        Type itype = attribExpr(tree.index, env, syms.intType);
++        // Tessera: bit selects and slices of unsigned values
++        Type lotype = tree instanceof JCSlice sl ? attribExpr(sl.lo, env, syms.intType) : null;
++        Type utype = tessera.indexType(tree, atype, itype, lotype);
++        if (utype != null) {
++            result = check(tree, utype, KindSelector.VAL, resultInfo);
++            return;
++        }
++        if (tree instanceof JCSlice && !atype.hasTag(ERROR))
++            log.error(tree.pos(), Errors.Tessera("x[hi:lo] needs an unsigned value or a type with an @Operator(\"[:]\") method, not " + atype));
+         if (types.isArray(atype))
+             owntype = types.elemtype(atype);
+         else if (!atype.hasTag(ERROR))
+@@ -5020,6 +5091,10 @@ Type litType(TypeTag tag) {
+     }
+ 
+     public void visitTypeIdent(JCPrimitiveTypeTree tree) {
++        if (tree instanceof JCUnsignedTypeTree u) {
++            result = check(tree, tessera.unsigned(u.bits, u.raw), KindSelector.TYP, resultInfo);
++            return;
++        }
+         result = check(tree, syms.typeOfTag[tree.typetag.ordinal()], KindSelector.TYP, resultInfo);
+     }
+ 
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
+new file mode 100644
+index 000000000..4ca3e2715
+--- /dev/null
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
+@@ -0,0 +1,635 @@
++/*
++ * Tessera language extensions for javac (GPL-2.0 with Classpath Exception, like the rest of javac).
++ *
++ *  - unsigned primitives: uint, ulong, ushort, ubyte, uint<N> (1..64) and raw bit vectors bits<N>,
++ *    with literals 123u / 123uL; they are int/long in class files;
++ *  - bit selects x[i], slices x[hi:lo] and concatenation {a, b} on those types;
++ *  - operators (+ - * & | ^ ~ << >> >>> < <= > >=, x[i], x[hi:lo], {a, b}) on reference types
++ *    whose methods carry an annotation named @Operator("+") etc.;
++ *  - automatic names: a local variable of a type with a static @Operator("name") method is
++ *    initialised through that method, which receives the variable's name.
++ */
++package com.sun.tools.javac.comp;
++
++import com.sun.tools.javac.code.Attribute;
++import com.sun.tools.javac.code.Flags;
++import com.sun.tools.javac.code.Kinds.Kind;
++import com.sun.tools.javac.code.Symbol;
++import com.sun.tools.javac.code.Symbol.ClassSymbol;
++import com.sun.tools.javac.code.Symbol.MethodSymbol;
++import com.sun.tools.javac.code.Symbol.OperatorSymbol;
++import com.sun.tools.javac.code.Symtab;
++import com.sun.tools.javac.code.Type;
++import com.sun.tools.javac.code.Type.UnsignedType;
++import com.sun.tools.javac.code.TypeTag;
++import com.sun.tools.javac.code.Types;
++import com.sun.tools.javac.resources.CompilerProperties.Errors;
++import com.sun.tools.javac.tree.JCTree;
++import com.sun.tools.javac.tree.JCTree.*;
++import com.sun.tools.javac.tree.TreeInfo;
++import com.sun.tools.javac.tree.TreeMaker;
++import com.sun.tools.javac.tree.TreeTranslator;
++import com.sun.tools.javac.util.Context;
++import com.sun.tools.javac.util.JCDiagnostic.DiagnosticPosition;
++import com.sun.tools.javac.util.List;
++import com.sun.tools.javac.util.ListBuffer;
++import com.sun.tools.javac.util.Log;
++import com.sun.tools.javac.util.Name;
++import com.sun.tools.javac.util.Names;
++
++import java.util.IdentityHashMap;
++import java.util.Map;
++
++import static com.sun.tools.javac.code.TypeTag.*;
++
++public class TesseraSyntax {
++    protected static final Context.Key<TesseraSyntax> key = new Context.Key<>();
++
++    public static TesseraSyntax instance(Context context) {
++        TesseraSyntax instance = context.get(key);
++        if (instance == null) instance = new TesseraSyntax(context);
++        return instance;
++    }
++
++    private final Symtab syms;
++    private final Types types;
++    private final Names names;
++    private final Log log;
++    private final Resolve rs;
++    private final Operators operators;
++    private final Map<Integer, UnsignedType> unsignedTypes = new java.util.HashMap<>();
++    /** Expressions rewritten to method calls during attribution, replaced during lowering. */
++    private final Map<JCTree, JCExpression> replacements = new IdentityHashMap<>();
++
++    @SuppressWarnings("this-escape")
++    protected TesseraSyntax(Context context) {
++        context.put(key, this);
++        syms = Symtab.instance(context);
++        types = Types.instance(context);
++        names = Names.instance(context);
++        log = Log.instance(context);
++        rs = Resolve.instance(context);
++        operators = Operators.instance(context);
++    }
++
++    // ------------------------------------------------------------------ types
++
++    /** The unsigned (or raw, for bits<N>) type of the given width. */
++    public UnsignedType unsigned(int bits, boolean raw) {
++        return unsignedTypes.computeIfAbsent(raw ? -bits : bits, k -> {
++            Type base = bits <= 32 ? syms.intType : syms.longType;
++            return new UnsignedType(base.getTag(), base.tsym, bits, raw);
++        });
++    }
++
++    public static boolean isUnsigned(Type t) {
++        return t instanceof UnsignedType;
++    }
++
++    static int bitsOf(Type t) {
++        return t instanceof UnsignedType u ? u.bits : t.hasTag(LONG) ? 64 : 32;
++    }
++
++    static long mask(int bits) {
++        return bits >= 64 ? -1L : (1L << bits) - 1;
++    }
++
++    /** The Java spelling of an operator, as used in {@code @Operator("...")}. */
++    static String opName(JCTree.Tag tag) {
++        return switch (tag) {
++            case PLUS, POS -> "+";
++            case MINUS, NEG -> "-";
++            case MUL -> "*";
++            case DIV -> "/";
++            case MOD -> "%";
++            case BITAND -> "&";
++            case BITOR -> "|";
++            case BITXOR -> "^";
++            case COMPL -> "~";
++            case NOT -> "!";
++            case SL -> "<<";
++            case SR -> ">>";
++            case USR -> ">>>";
++            case LT -> "<";
++            case LE -> "<=";
++            case GT -> ">";
++            case GE -> ">=";
++            case EQ -> "==";
++            case NE -> "!=";
++            case AND -> "&&";
++            case OR -> "||";
++            case PREINC, POSTINC -> "++";
++            case PREDEC, POSTDEC -> "--";
++            default -> tag.toString();
++        };
++    }
++
++    private void error(DiagnosticPosition pos, String msg) {
++        log.error(pos, Errors.Tessera(msg));
++    }
++
++    // ------------------------------------------------------------------ attribution hooks
++
++    /** The type of a cast from or to an unsigned type; constants are converted with unsigned semantics. */
++    Type castConstant(Type from, Type to) {
++        Object cv = from.constValue();
++        if (cv == null || !(cv instanceof Number n)) return to.baseType();
++        long v = n.longValue();
++        if (isUnsigned(from) && from.getTag() == INT) v &= 0xFFFF_FFFFL; // zero-extend
++        int bits = isUnsigned(to) ? ((UnsignedType) to).bits : to.hasTag(LONG) ? 64 : to.hasTag(INT) ? 32
++                : to.hasTag(SHORT) || to.hasTag(CHAR) ? 16 : to.hasTag(BYTE) ? 8 : 64;
++        if (isUnsigned(to)) v &= mask(bits);
++        Object nv = switch (to.getTag()) {
++            case LONG -> v;
++            case INT -> (int) v;
++            case SHORT -> (int) (short) v;
++            case CHAR -> (int) (char) v;
++            case BYTE -> (int) (byte) v;
++            case FLOAT -> isUnsigned(from) && from.getTag() == LONG && n.longValue() < 0
++                    ? (float) new java.math.BigInteger(Long.toUnsignedString(n.longValue())).doubleValue() : (float) v;
++            case DOUBLE -> isUnsigned(from) && from.getTag() == LONG && n.longValue() < 0
++                    ? new java.math.BigInteger(Long.toUnsignedString(n.longValue())).doubleValue() : (double) v;
++            default -> cv;
++        };
++        return to.baseType().constType(nv);
++    }
++
++    /** The type of {@code left op right} when an operand is unsigned (null: not unsigned). */
++    Type binaryType(JCBinary tree, Type left, Type right, Type operatorResult) {
++        boolean ul = isUnsigned(left), ur = isUnsigned(right);
++        if (!ul && !ur) return null;
++        if (operatorResult.hasTag(CLASS)) return null; // string concatenation
++        String op = opName(tree.getTag());
++        boolean raw = (ul && ((UnsignedType) left).raw) || (ur && ((UnsignedType) right).raw);
++        if (raw) {
++            switch (tree.getTag()) {
++                case BITAND, BITOR, BITXOR, SL, SR, USR, EQ, NE -> {}
++                default -> error(tree.pos(), "operator " + op + " is not defined for bit vectors; convert with (uint<N>) first");
++            }
++        }
++        if (operatorResult.hasTag(BOOLEAN) || operatorResult.hasTag(CLASS)) return null;
++        if (tree.hasTag(JCTree.Tag.SL) || tree.hasTag(JCTree.Tag.SR) || tree.hasTag(JCTree.Tag.USR))
++            return ul ? left.baseType() : null;
++        int bits = Math.max(ul ? ((UnsignedType) left).bits : 0, ur ? ((UnsignedType) right).bits : 0);
++        if (operatorResult.hasTag(LONG)) bits = Math.max(bits, (ul && ur) ? bits : 64);
++        return unsigned(Math.min(bits, operatorResult.hasTag(LONG) ? 64 : 32), raw);
++    }
++
++    Type unaryType(JCUnary tree, Type arg) {
++        if (!isUnsigned(arg)) return null;
++        var u = (UnsignedType) arg;
++        if (u.raw && !tree.hasTag(JCTree.Tag.COMPL))
++            error(tree.pos(), "operator " + opName(tree.getTag()) + " is not defined for bit vectors");
++        return arg.baseType();
++    }
++
++    /** Methods of {@code site} (or its superclasses) annotated {@code @Operator(op)}. */
++    Name operatorMethod(Type site, String op, boolean wantStatic) {
++        if (site == null || !site.hasTag(CLASS)) return null;
++        for (Type t = site; t != null && t.hasTag(CLASS); t = types.supertype(t)) {
++            var c = (ClassSymbol) t.tsym;
++            for (Symbol s : c.members().getSymbols(s -> s.kind == Kind.MTH)) {
++                if (wantStatic != ((s.flags() & Flags.STATIC) != 0)) continue;
++                for (Attribute.Compound a : s.getDeclarationAttributes()) {
++                    if (!a.type.tsym.getSimpleName().contentEquals("Operator")) continue;
++                    for (var p : a.values) {
++                        if (p.snd.getValue() instanceof String v && v.equals(op)) return s.name;
++                        if (p.snd instanceof Attribute.Array arr)
++                            for (Attribute e : arr.values)
++                                if (e.getValue() instanceof String v && v.equals(op)) return s.name;
++                    }
++                }
++            }
++        }
++        return null;
++    }
++
++    /** {@code lhs.method(rhs)} for an overloaded binary operator on a reference type, or null. */
++    JCExpression binaryOperatorCall(TreeMaker make, JCBinary tree, Type left, Type right) {
++        if (left.isPrimitive() || left.hasTag(ERROR)) return null;
++        if (tree.hasTag(JCTree.Tag.PLUS) && (types.isSameType(left, syms.stringType) || types.isSameType(right, syms.stringType)))
++            return null;
++        switch (tree.getTag()) {
++            case EQ, NE, AND, OR -> { return null; }
++            default -> {}
++        }
++        if (types.unboxedType(left).isPrimitive()) return null;
++        Name m = operatorMethod(left, opName(tree.getTag()), false);
++        if (m == null) return null;
++        var call = make.at(tree.pos).Apply(List.nil(), make.at(tree.pos).Select(tree.lhs, m), List.of(tree.rhs));
++        return call;
++    }
++
++    JCExpression unaryOperatorCall(TreeMaker make, JCUnary tree, Type arg) {
++        if (arg.isPrimitive() || arg.hasTag(ERROR) || types.unboxedType(arg).isPrimitive()) return null;
++        if (tree.getTag().isIncOrDecUnaryOp()) return null;
++        Name m = operatorMethod(arg, opName(tree.getTag()), false);
++        if (m == null) return null;
++        return make.at(tree.pos).Apply(List.nil(), make.at(tree.pos).Select(tree.arg, m), List.nil());
++    }
++
++    JCExpression indexOperatorCall(TreeMaker make, JCArrayAccess tree, Type indexed) {
++        if (indexed.isPrimitive() || indexed.hasTag(ERROR) || types.isArray(indexed)) return null;
++        boolean slice = tree instanceof JCSlice;
++        Name m = operatorMethod(indexed, slice ? "[:]" : "[]", false);
++        if (m == null) return null;
++        var args = slice ? List.of(tree.index, ((JCSlice) tree).lo) : List.of(tree.index);
++        return make.at(tree.pos).Apply(List.nil(), make.at(tree.pos).Select(tree.indexed, m), args);
++    }
++
++    JCExpression concatOperatorCall(TreeMaker make, JCNewArray tree, Type first) {
++        if (first.isPrimitive() || first.hasTag(ERROR)) return null;
++        Name m = operatorMethod(first, "{}", false);
++        if (m == null) return null;
++        return make.at(tree.pos).Apply(List.nil(), make.at(tree.pos).Select(tree.elems.head, m), tree.elems.tail);
++    }
++
++    void replace(JCTree original, JCExpression with) {
++        replacements.put(original, with);
++    }
++
++    /** Type of x[i] / x[hi:lo] on an unsigned value, or null when x is not unsigned. */
++    Type indexType(JCArrayAccess tree, Type indexed, Type index, Type lo) {
++        if (!isUnsigned(indexed)) return null;
++        var u = (UnsignedType) indexed;
++        if (tree instanceof JCSlice) {
++            Object hi = index.constValue(), l = lo == null ? null : lo.constValue();
++            if (!(hi instanceof Number h) || !(l instanceof Number ln)) {
++                error(tree.pos(), "slice bounds must be constants");
++                return u;
++            }
++            int hv = h.intValue(), lv = ln.intValue();
++            if (lv < 0 || hv >= u.bits || hv < lv) {
++                error(tree.pos(), "slice [" + hv + ":" + lv + "] out of range for " + u);
++                return u;
++            }
++            return unsigned(hv - lv + 1, u.raw);
++        }
++        return syms.booleanType;
++    }
++
++    Type concatType(JCNewArray tree, List<Type> elems) {
++        int bits = 0;
++        boolean raw = false;
++        for (Type t : elems) {
++            if (!isUnsigned(t)) return null;
++            bits += ((UnsignedType) t).bits;
++            raw |= ((UnsignedType) t).raw;
++        }
++        if (bits > 64) {
++            error(tree.pos(), "concatenation is " + bits + " bits wide; at most 64 bits are supported");
++            bits = 64;
++        }
++        return unsigned(bits, raw);
++    }
++
++    // ------------------------------------------------------------------ lowering
++
++    /** Rewrite the Tessera constructs of a class into plain Java (before erasure). */
++    public JCTree lower(Env<AttrContext> env, JCTree tree, TreeMaker make) {
++        return new Lowerer(env, make).translate(tree);
++    }
++
++    private final class Lowerer extends TreeTranslator {
++        final Env<AttrContext> env;
++        final TreeMaker make;
++        Type methodReturn;
++
++        Lowerer(Env<AttrContext> env, TreeMaker make) {
++            this.env = env;
++            this.make = make;
++        }
++
++        // ---------------- helpers building attributed trees
++
++        JCExpression intLit(TypeTag tag, long v) {
++            Object val = tag == LONG ? (Object) v : (Object) (int) v;
++            Type t = (tag == LONG ? syms.longType : syms.intType).constType(val);
++            return make.Literal(tag, val).setType(t);
++        }
++
++        JCBinary binary(JCTree.Tag tag, JCExpression l, JCExpression r, Type resultType) {
++            OperatorSymbol op = operators.resolveBinary(l, tag, l.type.baseType(), r.type.baseType());
++            JCBinary b = make.Binary(tag, l, r);
++            b.operator = op;
++            b.type = resultType;
++            return b;
++        }
++
++        JCExpression masked(JCExpression e, Type t) {
++            if (!(t instanceof UnsignedType u)) return e;
++            if (u.bits == 32 || u.bits == 64) return e;
++            return binary(JCTree.Tag.BITAND, e, intLit(u.getTag(), mask(u.bits)), u);
++        }
++
++        JCExpression call(Type site, String name, List<Type> argtypes, List<JCExpression> args) {
++            MethodSymbol m = rs.resolveInternalMethod(env.tree.pos(), env, site, names.fromString(name), argtypes, List.nil());
++            JCExpression c = make.App(make.QualIdent(m), args);
++            return c;
++        }
++
++        /** Zero-extend a 32-bit unsigned value used where a long (or float/double) is expected. */
++        JCExpression coerce(JCExpression e, Type target) {
++            if (!(e.type instanceof UnsignedType u) || u.getTag() != INT) return e;
++            if (!(target.hasTag(LONG) || target.hasTag(FLOAT) || target.hasTag(DOUBLE))) return e;
++            JCExpression asLong = make.TypeCast(syms.longType, e).setType(syms.longType);
++            JCExpression z = binary(JCTree.Tag.BITAND, asLong, intLit(LONG, 0xFFFF_FFFFL), syms.longType);
++            if (target.hasTag(LONG)) return z;
++            return make.TypeCast(target, z).setType(target);
++        }
++
++        boolean isConstFitting(Type found, int bits) {
++            Object c = found.constValue();
++            if (!(c instanceof Number n)) return false;
++            long v = n.longValue();
++            if (isUnsigned(found)) return bits >= 64 || Long.compareUnsigned(v & mask(bitsOf(found)), mask(bits)) <= 0;
++            return v >= 0 && (bits >= 64 || v <= mask(bits));
++        }
++
++        /** Signedness rules for assigning {@code found} where {@code req} is expected. */
++        void checkAssign(DiagnosticPosition pos, Type found, Type req) {
++            if (found == null || req == null || found.hasTag(ERROR) || req.hasTag(ERROR)) return;
++            boolean uf = isUnsigned(found), ur = isUnsigned(req);
++            if (ur && !uf) {
++                if (found.isNumeric() && !isConstFitting(found, ((UnsignedType) req).bits))
++                    error(pos, "cannot convert signed " + found.baseType() + " to " + req + " implicitly; use a cast (" + req + ")");
++            } else if (uf && !ur) {
++                if (req.hasTag(LONG) && found.getTag() == INT) return; // zero-extension
++                if (req.hasTag(FLOAT) || req.hasTag(DOUBLE)) return;
++                if (!req.isPrimitive())
++                    error(pos, "unsigned value " + found + " cannot be boxed to " + req);
++                else
++                    error(pos, "cannot convert " + found + " to signed " + req + " implicitly; use a cast (" + req + ")");
++            } else if (uf) {
++                var a = (UnsignedType) found;
++                var b = (UnsignedType) req;
++                if (a.raw != b.raw && !isConstFitting(found, b.bits))
++                    error(pos, "cannot convert " + found + " to " + req + " implicitly; use a cast");
++                else if (a.bits > b.bits && !isConstFitting(found, b.bits))
++                    error(pos, found + " is wider than " + req + "; narrow it with a cast (" + req + ")");
++            }
++        }
++
++        // ---------------- tree visitors
++
++        @Override
++        public <T extends JCTree> T translate(T tree) {
++            if (tree != null && replacements.containsKey(tree)) {
++                @SuppressWarnings("unchecked")
++                T r = (T) translate(replacements.remove(tree));
++                return r;
++            }
++            return super.translate(tree);
++        }
++
++        @Override
++        public void visitMethodDef(JCMethodDecl tree) {
++            Type prev = methodReturn;
++            methodReturn = tree.sym == null ? null : tree.sym.type.getReturnType();
++            super.visitMethodDef(tree);
++            methodReturn = prev;
++        }
++
++        @Override
++        public void visitLambda(JCLambda tree) {
++            Type prev = methodReturn;
++            methodReturn = null;
++            super.visitLambda(tree);
++            methodReturn = prev;
++        }
++
++        @Override
++        public void visitVarDef(JCVariableDecl tree) {
++            super.visitVarDef(tree);
++            if (tree.init == null || tree.sym == null) return;
++            checkAssign(tree.init.pos(), tree.init.type, tree.sym.type);
++            tree.init = coerce(tree.init, tree.sym.type);
++            if (tree.sym.owner.kind == Kind.MTH && !tree.sym.type.isPrimitive()) autoName(tree);
++        }
++
++        /** {@code T x = init;} becomes {@code T x = T.name(init, "x");} when T declares @Operator("name"). */
++        void autoName(JCVariableDecl tree) {
++            JCExpression init = TreeInfo.skipParens(tree.init);
++            if (init.hasTag(JCTree.Tag.IDENT) || init.hasTag(JCTree.Tag.LITERAL)) return;
++            Type t = tree.sym.type;
++            Name m = operatorMethod(t, "name", true);
++            if (m == null) return;
++            Symbol owner = null;
++            for (Type s = t; s != null && s.hasTag(CLASS) && owner == null; s = types.supertype(s))
++                for (Symbol x : s.tsym.members().getSymbolsByName(m)) if (x.kind == Kind.MTH) owner = x;
++            if (!(owner instanceof MethodSymbol ms)) return;
++            make.at(tree.init.pos);
++            JCExpression name = make.Literal(tree.name.toString()).setType(syms.stringType.constType(tree.name.toString()));
++            JCExpression c = make.App(make.QualIdent(ms), List.of(tree.init, name));
++            c.type = t;
++            tree.init = make.TypeCast(t, c).setType(t);
++        }
++
++        @Override
++        public void visitAssign(JCAssign tree) {
++            super.visitAssign(tree);
++            checkAssign(tree.rhs.pos(), tree.rhs.type, tree.lhs.type);
++            tree.rhs = coerce(tree.rhs, tree.lhs.type);
++        }
++
++        @Override
++        public void visitReturn(JCReturn tree) {
++            super.visitReturn(tree);
++            if (tree.expr != null && methodReturn != null) {
++                checkAssign(tree.expr.pos(), tree.expr.type, methodReturn);
++                tree.expr = coerce(tree.expr, methodReturn);
++            }
++        }
++
++        @Override
++        public void visitApply(JCMethodInvocation tree) {
++            super.visitApply(tree);
++            Symbol s = TreeInfo.symbol(tree.meth);
++            if (!(s instanceof MethodSymbol ms)) return;
++            List<Type> params = ms.type.getParameterTypes();
++            ListBuffer<JCExpression> args = new ListBuffer<>();
++            for (List<JCExpression> l = tree.args; l.nonEmpty(); l = l.tail) {
++                JCExpression a = l.head;
++                if (params.nonEmpty()) {
++                    Type p = params.head;
++                    if (!(params.tail.isEmpty() && ms.isVarArgs())) {
++                        checkAssign(a.pos(), a.type, p);
++                        a = coerce(a, p);
++                    }
++                    params = params.tail.isEmpty() ? params : params.tail;
++                }
++                args.append(a);
++            }
++            tree.args = args.toList();
++        }
++
++        @Override
++        public void visitTypeCast(JCTypeCast tree) {
++            super.visitTypeCast(tree);
++            Type to = tree.type;
++            Type from = tree.expr.type;
++            if (isUnsigned(from) && !isUnsigned(to) && (to.hasTag(LONG) || to.hasTag(FLOAT) || to.hasTag(DOUBLE))) {
++                result = coerce(tree.expr, to);
++                return;
++            }
++            if (to instanceof UnsignedType u && u.bits != 32 && u.bits != 64 && from.isNumeric()) {
++                // narrowing into a sub-word unsigned type: keep the low bits
++                JCExpression inner = tree.expr;
++                if (from.getTag() != u.getTag()) inner = make.TypeCast(syms.typeOfTag[u.getTag().ordinal()], inner).setType(syms.typeOfTag[u.getTag().ordinal()]);
++                result = masked(inner, u);
++            }
++        }
++
++        @Override
++        public void visitUnary(JCUnary tree) {
++            super.visitUnary(tree);
++            if (!(tree.type instanceof UnsignedType u)) return;
++            if (tree.hasTag(JCTree.Tag.COMPL) || tree.hasTag(JCTree.Tag.NEG)) result = masked(tree, u);
++        }
++
++        @Override
++        public void visitExec(JCExpressionStatement tree) {
++            // u++ / ++u / u += x on sub-word unsigned values: wrap to the width
++            JCExpression e = tree.expr;
++            if (e instanceof JCUnary un && un.getTag().isIncOrDecUnaryOp() && un.arg.type instanceof UnsignedType u
++                    && u.bits != 32 && u.bits != 64 && (un.arg.hasTag(JCTree.Tag.IDENT) || un.arg.hasTag(JCTree.Tag.SELECT))) {
++                boolean inc = un.hasTag(JCTree.Tag.PREINC) || un.hasTag(JCTree.Tag.POSTINC);
++                JCExpression one = intLit(u.getTag(), 1);
++                JCExpression rhs = masked(binary(inc ? JCTree.Tag.PLUS : JCTree.Tag.MINUS, un.arg, one, u), u);
++                JCAssign asg = make.at(tree.pos).Assign(un.arg, rhs);
++                asg.type = u;
++                tree.expr = asg;
++                result = tree;
++                return;
++            }
++            if (e instanceof JCAssignOp ao && ao.lhs.type instanceof UnsignedType u && (ao.lhs.hasTag(JCTree.Tag.IDENT) || ao.lhs.hasTag(JCTree.Tag.SELECT))) {
++                JCTree.Tag t = ao.getTag().noAssignOp();
++                JCBinary b = make.at(ao.pos).Binary(t, ao.lhs, ao.rhs);
++                b.operator = ao.operator;
++                b.type = u;
++                JCAssign asg = make.at(tree.pos).Assign(ao.lhs, b);
++                asg.type = u;
++                tree.expr = asg;
++                super.visitExec(tree);
++                return;
++            }
++            super.visitExec(tree);
++        }
++
++        @Override
++        public void visitBinary(JCBinary tree) {
++            super.visitBinary(tree);
++            Type lt = tree.lhs.type, rt = tree.rhs.type;
++            boolean ul = isUnsigned(lt), ur = isUnsigned(rt);
++            // string conversion of unsigned values
++            if (tree.hasTag(JCTree.Tag.PLUS) && types.isSameType(tree.type, syms.stringType)) {
++                if (ul) tree.lhs = toUnsignedString(tree.lhs);
++                if (ur) tree.rhs = toUnsignedString(tree.rhs);
++                if (ul || ur) tree.operator = operators.resolveBinary(tree, JCTree.Tag.PLUS, tree.lhs.type, tree.rhs.type);
++                return;
++            }
++            if (!ul && !ur) return;
++            // signed and unsigned operands may only meet through constants
++            if (ul != ur) {
++                Type signed = ul ? rt : lt;
++                Type uns = ul ? lt : rt;
++                boolean shift = tree.hasTag(JCTree.Tag.SL) || tree.hasTag(JCTree.Tag.SR) || tree.hasTag(JCTree.Tag.USR);
++                if (!shift && signed.isNumeric() && !isConstFitting(signed, ((UnsignedType) uns).bits))
++                    error(tree.pos(), "cannot mix signed " + signed.baseType() + " and " + uns + "; cast one of them");
++            }
++            // widen 32-bit unsigned operands of long operations by zero-extension
++            if (tree.operator != null && tree.operator.type.getParameterTypes().head.hasTag(LONG)) {
++                tree.lhs = coerce(tree.lhs, syms.longType);
++                tree.rhs = coerce(tree.rhs, syms.longType);
++            }
++            Type ot = (ul ? lt : rt);
++            int bits = bitsOf(ot);
++            TypeTag tag = tree.lhs.type.getTag() == LONG || tree.rhs.type.getTag() == LONG ? LONG : INT;
++            boolean full = (tag == INT && bits == 32) || (tag == LONG && bits == 64);
++            switch (tree.getTag()) {
++                case DIV, MOD -> {
++                    Type site = tag == LONG ? syms.longType : syms.intType;
++                    Type boxed = types.boxedClass(site).type;
++                    Type prim = tag == LONG ? syms.longType : syms.intType;
++                    result = call(boxed, tree.hasTag(JCTree.Tag.DIV) ? "divideUnsigned" : "remainderUnsigned",
++                            List.of(prim, prim), List.of(tree.lhs, tree.rhs));
++                    result.type = tree.type;
++                }
++                case LT, LE, GT, GE -> {
++                    if (full && ul && ur) {
++                        JCExpression min = intLit(tag, tag == LONG ? Long.MIN_VALUE : Integer.MIN_VALUE);
++                        Type p = tag == LONG ? syms.longType : syms.intType;
++                        tree.lhs = binary(JCTree.Tag.BITXOR, tree.lhs, min, p);
++                        tree.rhs = binary(JCTree.Tag.BITXOR, tree.rhs, intLit(tag, tag == LONG ? Long.MIN_VALUE : Integer.MIN_VALUE), p);
++                    } else if (full) {
++                        // unsigned vs non-negative constant: compare unsigned
++                        JCExpression l = tree.lhs, r = tree.rhs;
++                        Type p = tag == LONG ? syms.longType : syms.intType;
++                        tree.lhs = binary(JCTree.Tag.BITXOR, l, intLit(tag, tag == LONG ? Long.MIN_VALUE : Integer.MIN_VALUE), p);
++                        tree.rhs = binary(JCTree.Tag.BITXOR, r, intLit(tag, tag == LONG ? Long.MIN_VALUE : Integer.MIN_VALUE), p);
++                    }
++                }
++                case SR -> {
++                    if (ul) {
++                        tree.operator = operators.resolveBinary(tree, JCTree.Tag.USR, tree.lhs.type.baseType(), tree.rhs.type.baseType());
++                        JCBinary b = make.at(tree.pos).Binary(JCTree.Tag.USR, tree.lhs, tree.rhs);
++                        b.operator = tree.operator;
++                        b.type = tree.type;
++                        result = b;
++                    }
++                }
++                case PLUS, MINUS, MUL, SL -> result = masked(tree, tree.type);
++                default -> {}
++            }
++        }
++
++        JCExpression toUnsignedString(JCExpression e) {
++            var u = (UnsignedType) e.type;
++            if (u.bits != 32 && u.bits != 64) return e;
++            Type prim = u.getTag() == LONG ? syms.longType : syms.intType;
++            make.at(e.pos);
++            return call(types.boxedClass(prim).type, "toUnsignedString", List.of(prim), List.of(e));
++        }
++
++        @Override
++        public void visitIndexed(JCArrayAccess tree) {
++            super.visitIndexed(tree);
++            if (tree instanceof JCSlice s) s.lo = translate(s.lo);
++            if (!(tree.indexed.type instanceof UnsignedType u)) return;
++            TypeTag tag = u.getTag();
++            Type p = tag == LONG ? syms.longType : syms.intType;
++            make.at(tree.pos);
++            if (tree instanceof JCSlice s) {
++                int lo = ((Number) s.lo.type.constValue()).intValue();
++                JCExpression shifted = lo == 0 ? tree.indexed : binary(JCTree.Tag.USR, tree.indexed, intLit(INT, lo), p);
++                result = masked(shifted, tree.type);
++                result.type = tree.type;
++            } else {
++                JCExpression shifted = binary(JCTree.Tag.USR, tree.indexed, tree.index, p);
++                JCExpression bit = binary(JCTree.Tag.BITAND, shifted, intLit(tag, 1), p);
++                result = binary(JCTree.Tag.NE, bit, intLit(tag, 0), syms.booleanType);
++            }
++        }
++
++        @Override
++        public void visitNewArray(JCNewArray tree) {
++            super.visitNewArray(tree);
++            if (!(tree.type instanceof UnsignedType u)) return;
++            // {a, b, c}: a is the most significant part
++            make.at(tree.pos);
++            TypeTag tag = u.getTag();
++            Type p = tag == LONG ? syms.longType : syms.intType;
++            JCExpression acc = null;
++            int shift = 0;
++            for (List<JCExpression> l = tree.elems.reverse(); l.nonEmpty(); l = l.tail) {
++                JCExpression e = l.head;
++                if (tag == LONG && e.type.getTag() == INT) e = coerce(e, syms.longType);
++                JCExpression part = shift == 0 ? e : binary(JCTree.Tag.SL, e, intLit(INT, shift), p);
++                acc = acc == null ? part : binary(JCTree.Tag.BITOR, acc, part, p);
++                shift += bitsOf(l.head.type);
++            }
++            acc.type = u;
++            result = acc;
++        }
++    }
++}
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/main/JavaCompiler.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/main/JavaCompiler.java
+index 52979ab16..cb58c7ccc 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/main/JavaCompiler.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/main/JavaCompiler.java
+@@ -1658,6 +1658,9 @@ public void visitSwitchExpression(JCSwitchExpression tree) {
+             if (shouldStop(CompileState.TRANSTYPES))
+                 return;
+ 
++            // Tessera: unsigned arithmetic, slices, concatenation, operator calls, automatic names
++            env.tree = TesseraSyntax.instance(context).lower(env, env.tree, localMake);
++
+             env.tree = transTypes.translateTopLevelClass(env.tree, localMake);
+             compileStates.put(env, CompileState.TRANSTYPES);
+ 
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavaTokenizer.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavaTokenizer.java
+index d799975a7..13f94adf3 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavaTokenizer.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavaTokenizer.java
+@@ -652,11 +652,14 @@ private void scanNumber(int pos, int radix) {
+                 }
+             }
+ 
++            // Tessera: unsigned literals 123u, 123uL
++            boolean unsignedSuffix = acceptOneOf('u', 'U');
+             if (acceptOneOf('l', 'L')) {
+                 tk = TokenKind.LONGLITERAL;
+             } else {
+                 tk = TokenKind.INTLITERAL;
+             }
++            if (unsignedSuffix) sb.append('u');
+         }
+     }
+ 
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
+index 1383baa57..b2fb014f2 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
+@@ -829,6 +829,132 @@ JCExpression literal(Name prefix) {
+         return literal(prefix, token.pos);
+     }
+ 
++    // ---------------------------------------------------------------- Tessera syntax
++
++    /** Tessera: {@code 123u} / {@code 123uL}: a cast of the bit pattern to uint / ulong. */
++    JCExpression unsignedLiteral(Name prefix, int pos, int bits) {
++        String digits = token.stringVal();
++        digits = digits.substring(0, digits.length() - 1);
++        if (prefix == names.hyphen) {
++            log.error(DiagnosticFlag.SYNTAX, pos, Errors.Tessera("unsigned literals cannot be negative"));
++            return errorTree;
++        }
++        java.math.BigInteger v;
++        try {
++            v = new java.math.BigInteger(digits.replace("_", ""), token.radix());
++        } catch (NumberFormatException ex) {
++            reportIntegralLiteralError(prefix, pos);
++            return errorTree;
++        }
++        if (v.bitLength() > bits) {
++            log.error(DiagnosticFlag.SYNTAX, pos, Errors.Tessera("unsigned literal " + v + " does not fit in " + bits + " bits"));
++            return errorTree;
++        }
++        JCExpression lit = bits == 32 ? F.at(pos).Literal(TypeTag.INT, v.intValue())
++                : F.at(pos).Literal(TypeTag.LONG, v.longValue());
++        JCUnsignedTypeTree type = new JCUnsignedTypeTree(bits, false);
++        type.pos = pos;
++        return F.at(pos).TypeCast(type, lit);
++    }
++
++    /** Tessera: identifiers that name unsigned types when used as a type. */
++    boolean isUnsignedTypeName(Token t) {
++        if (t.kind != IDENTIFIER) return false;
++        String n = t.name().toString();
++        return n.equals("uint") || n.equals("ulong") || n.equals("ushort") || n.equals("ubyte") || n.equals("bits");
++    }
++
++    /** Tessera: is the identifier at {@code S.token(lookahead)} the start of an unsigned type? */
++    boolean unsignedTypeAhead(int lookahead) {
++        Token t = S.token(lookahead);
++        if (!isUnsignedTypeName(t)) return false;
++        boolean width = S.token(lookahead + 1).kind == LT && S.token(lookahead + 2).kind == INTLITERAL
++                && S.token(lookahead + 3).kind == GT;
++        if (t.name().toString().equals("bits")) return width;
++        if (width) return t.name().toString().equals("uint");
++        TokenKind next = S.token(lookahead + 1).kind;
++        return next == IDENTIFIER || next == UNDERSCORE || next == RPAREN || next == ELLIPSIS
++                || (next == LBRACKET && S.token(lookahead + 2).kind == RBRACKET);
++    }
++
++    /** Tessera: uint | ulong | ushort | ubyte | uint '<' N '>' | bits '<' N '>' */
++    JCPrimitiveTypeTree unsignedBasicType() {
++        int pos = token.pos;
++        String n = token.name().toString();
++        nextToken();
++        boolean raw = n.equals("bits");
++        int bits = switch (n) {
++            case "ulong" -> 64;
++            case "ushort" -> 16;
++            case "ubyte" -> 8;
++            default -> 32;
++        };
++        if (token.kind == LT) {
++            nextToken();
++            try {
++                bits = Convert.string2int(token.stringVal(), token.radix());
++            } catch (NumberFormatException ex) {
++                bits = 0;
++            }
++            nextToken();
++            accept(GT);
++            if (bits < 1 || bits > 64) {
++                log.error(DiagnosticFlag.SYNTAX, pos, Errors.Tessera("width must be between 1 and 64, got " + bits));
++                bits = 32;
++            }
++        }
++        JCUnsignedTypeTree t = new JCUnsignedTypeTree(bits, raw);
++        t.pos = pos;
++        selectTypeMode();
++        return toP(t);
++    }
++
++    /** Tessera: {@code x[hi:lo]} after the index has been parsed. */
++    JCExpression indexedOrSlice(int pos, JCExpression t, JCExpression index) {
++        if (token.kind == COLON) {
++            nextToken();
++            JCExpression lo = term();
++            JCSlice s = new JCSlice(t, index, lo);
++            s.pos = pos;
++            return to(s);
++        }
++        return to(F.at(pos).Indexed(t, index));
++    }
++
++    /** End position of the last trailing block, so its statement may omit the semicolon. */
++    private int trailingBlockEnd = -1;
++
++    /** Tessera: a block after a call is a trailing lambda argument: {@code when (c) { ... }}. */
++    JCExpression trailingBlock(JCExpression t) {
++        if (token.kind != LBRACE || !isMode(EXPR)) return t;
++        int prevmode = mode;
++        int bpos = token.pos;
++        JCBlock body = block();
++        setMode(prevmode);
++        trailingBlockEnd = S.prevToken().endPos;
++        JCLambda lambda = toP(F.at(bpos).Lambda(List.nil(), body));
++        if (t instanceof JCMethodInvocation mi) {
++            mi.args = mi.args.append(lambda);
++            return mi;
++        }
++        return toP(F.at(bpos).Apply(List.nil(), t, List.of(lambda)));
++    }
++
++    /** Tessera: '{' expr {',' expr} '}' in expression position: a concatenation. */
++    JCExpression concatenation(int pos) {
++        accept(LBRACE);
++        ListBuffer<JCExpression> elems = new ListBuffer<>();
++        elems.append(parseExpression());
++        while (token.kind == COMMA) {
++            nextToken();
++            elems.append(parseExpression());
++        }
++        accept(RBRACE);
++        JCConcat c = new JCConcat(elems.toList());
++        c.pos = pos;
++        return toP(c);
++    }
++
+     /**
+      * Literal =
+      *     INTLITERAL
+@@ -845,6 +971,10 @@ JCExpression literal(Name prefix, int pos) {
+         JCExpression t = errorTree;
+         switch (token.kind) {
+         case INTLITERAL:
++            if (token.stringVal().endsWith("u")) {
++                t = unsignedLiteral(prefix, pos, 32);
++                break;
++            }
+             try {
+                 t = F.at(pos).Literal(
+                     TypeTag.INT,
+@@ -854,6 +984,10 @@ JCExpression literal(Name prefix, int pos) {
+             }
+             break;
+         case LONGLITERAL:
++            if (token.stringVal().endsWith("u")) {
++                t = unsignedLiteral(prefix, pos, 64);
++                break;
++            }
+             try {
+                 t = F.at(pos).Literal(
+                     TypeTag.LONG,
+@@ -1552,6 +1686,10 @@ protected JCExpression term3() {
+             break;
+         case UNDERSCORE: case IDENTIFIER: case ASSERT: case ENUM:
+             if (typeArgs != null) return illegal();
++            if (isMode(TYPE) && unsignedTypeAhead(0)) {
++                t = bracketsSuffix(bracketsOpt(unsignedBasicType()));
++                break;
++            }
+             if (isMode(EXPR) && !isMode(NOLAMBDA) && peekToken(ARROW)) {
+                 t = lambdaExpressionOrStatement(false, false, pos);
+             } else {
+@@ -1581,7 +1719,7 @@ protected JCExpression term3() {
+                                 selectExprMode();
+                                 JCExpression t1 = term();
+                                 if (!annos.isEmpty()) t = illegal(annos.head.pos);
+-                                t = to(F.at(pos).Indexed(t, t1));
++                                t = indexedOrSlice(pos, t, t1);
+                             }
+                             accept(RBRACKET);
+                         }
+@@ -1653,6 +1791,12 @@ protected JCExpression term3() {
+                             t = toP(F.at(tyannos.head.pos).AnnotatedType(tyannos, t));
+                         }
+                         break;
++                    case LBRACE:
++                        if (isMode(EXPR) && t.hasTag(SELECT) && annos.isEmpty()) {
++                            selectExprMode();
++                            t = trailingBlock(t);
++                        }
++                        break loop;
+                     case ELLIPSIS:
+                         if (this.permitTypeAnnotationsPushBack) {
+                             this.typeAnnotationsPushedBack = annos;
+@@ -1750,6 +1894,13 @@ protected JCExpression term3() {
+                 }
+             }
+             // Not reachable.
++        case LBRACE:
++            if (typeArgs == null && isMode(EXPR)) {
++                selectExprMode();
++                t = concatenation(pos);
++                break;
++            }
++            return illegal();
+         default:
+             return illegal();
+         }
+@@ -1835,7 +1986,7 @@ JCExpression term3Rest(JCExpression t, List<JCExpression> typeArgs) {
+                 if (isMode(EXPR)) {
+                     selectExprMode();
+                     JCExpression t1 = term();
+-                    t = to(F.at(pos1).Indexed(t, t1));
++                    t = indexedOrSlice(pos1, t, t1);
+                 }
+                 accept(RBRACKET);
+             } else if (token.kind == DOT) {
+@@ -1873,6 +2024,7 @@ JCExpression term3Rest(JCExpression t, List<JCExpression> typeArgs) {
+                         t = toP(F.at(tyannos.head.pos).AnnotatedType(tyannos, t));
+                     }
+                     t = argumentsOpt(typeArgs, typeArgumentsOpt(t));
++                    if (t.hasTag(SELECT)) t = trailingBlock(t);
+                     typeArgs = null;
+                 }
+             } else if (isMode(EXPR) && token.kind == COLCOL) {
+@@ -2028,6 +2180,12 @@ ParensResult analyzeParens() {
+                 case ASSERT:
+                 case ENUM:
+                 case IDENTIFIER:
++                    if (tk == IDENTIFIER && lookahead == 1 && unsignedTypeAhead(lookahead)) {
++                        // Tessera: (uint) x, (uint<12>) x, (uint x) -> ...
++                        int after = S.token(lookahead + 1).kind == LT ? lookahead + 4 : lookahead + 1;
++                        if (S.token(after).kind == RPAREN) return ParensResult.CAST;
++                        if (LAX_IDENTIFIER.test(S.token(after).kind)) return ParensResult.EXPLICIT_LAMBDA;
++                    }
+                     if (peekToken(lookahead, LAX_IDENTIFIER)) {
+                         // Identifier, Identifier/'_'/'assert'/'enum' -> explicit lambda
+                         return ParensResult.EXPLICIT_LAMBDA;
+@@ -2323,6 +2481,7 @@ JCExpression arguments(List<JCExpression> typeArgs, JCExpression t) {
+         int pos = token.pos;
+         List<JCExpression> args = arguments();
+         JCExpression mi = F.at(pos).Apply(typeArgs, t, args);
++        mi = trailingBlock(mi);
+         if (t.hasTag(IDENT) && isInvalidUnqualifiedMethodIdentifier(((JCIdent) t).pos,
+                                                                     ((JCIdent) t).name)) {
+             log.error(DiagnosticFlag.SYNTAX, t, Errors.InvalidYield);
+@@ -2345,6 +2504,20 @@ boolean isInvalidUnqualifiedMethodIdentifier(int pos, Name name) {
+     /**  TypeArgumentsOpt = [ TypeArguments ]
+      */
+     JCExpression typeArgumentsOpt(JCExpression t) {
++        if (token.kind == LT && isMode(TYPE) && !isMode(NOPARAMS)
++                && S.token(1).kind == INTLITERAL && S.token(2).kind == GT) {
++            // Tessera: T<N> is T with the type annotation @org.eninehq.tessera.core.Width(N)
++            int pos = token.pos;
++            nextToken();
++            JCExpression width = literal(names.empty);
++            accept(GT);
++            selectTypeMode();
++            JCExpression annType = F.at(pos).Ident(names.fromString("org"));
++            for (String part : new String[]{"eninehq", "tessera", "core", "Width"})
++                annType = F.at(pos).Select(annType, names.fromString(part));
++            JCAnnotation ann = F.at(pos).TypeAnnotation(annType, List.of(width));
++            return toP(F.at(pos).AnnotatedType(List.of(ann), t));
++        }
+         if (token.kind == LT &&
+             isMode(TYPE) &&
+             !isMode(NOPARAMS)) {
+@@ -3018,7 +3191,8 @@ List<JCStatement> blockStatement() {
+             } else {
+                 // This Exec is an "ExpressionStatement"; it subsumes the terminating semicolon
+                 t = checkExprStat(t);
+-                accept(SEMI);
++                // Tessera: a statement ending in a trailing block needs no semicolon
++                if (token.kind == SEMI || S.prevToken().endPos != trailingBlockEnd) accept(SEMI);
+                 JCExpressionStatement expr = toP(F.at(pos).Exec(t));
+                 return List.of(expr);
+             }
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
+index ead48ee62..88c554af9 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -4264,3 +4264,8 @@ compiler.warn.attempt.to.use.value.based.where.identity.expected=\
+ compiler.err.enclosing.class.type.non.denotable=\
+     enclosing class type: {0}\n\
+     is non-denotable, try casting to a denotable type
++
++# Tessera language extensions
++# 0: string
++compiler.err.tessera=\
++    {0}
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
+index de86b7e2c..1148e4d03 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
+@@ -2773,6 +2773,33 @@ public Tag getTag() {
+         }
+     }
+ 
++    /** Tessera: an unsigned type {@code uint}, {@code uint<N>}, ... or a bit vector {@code bits<N>}. */
++    public static class JCUnsignedTypeTree extends JCPrimitiveTypeTree {
++        public final int bits;
++        public final boolean raw;
++        public JCUnsignedTypeTree(int bits, boolean raw) {
++            super(bits <= 32 ? TypeTag.INT : TypeTag.LONG);
++            this.bits = bits;
++            this.raw = raw;
++        }
++    }
++
++    /** Tessera: a slice {@code indexed[index:lo]} (high bit first). */
++    public static class JCSlice extends JCArrayAccess {
++        public JCExpression lo;
++        public JCSlice(JCExpression indexed, JCExpression hi, JCExpression lo) {
++            super(indexed, hi);
++            this.lo = lo;
++        }
++    }
++
++    /** Tessera: a concatenation {@code {a, b}} in expression position. */
++    public static class JCConcat extends JCNewArray {
++        public JCConcat(List<JCExpression> elems) {
++            super(null, List.nil(), elems);
++        }
++    }
++
+     /**
+      * Identifies a basic type.
+      * @see TypeTag
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+index 9c3ed3bbc..25887bff4 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+@@ -272,6 +272,11 @@ public JCTree visitArrayAccess(ArrayAccessTree node, P p) {
+         JCArrayAccess t = (JCArrayAccess) node;
+         JCExpression indexed = copy(t.indexed, p);
+         JCExpression index = copy(t.index, p);
++        if (t instanceof JCSlice s) {
++            JCSlice c = new JCSlice(indexed, index, copy(s.lo, p));
++            c.pos = t.pos;
++            return c;
++        }
+         return M.at(t.pos).Indexed(indexed, index);
+     }
+ 
+@@ -324,6 +329,11 @@ public JCTree visitNewArray(NewArrayTree node, P p) {
+         JCExpression elemtype = copy(t.elemtype, p);
+         List<JCExpression> dims = copy(t.dims, p);
+         List<JCExpression> elems = copy(t.elems, p);
++        if (t instanceof JCConcat) {
++            JCConcat c = new JCConcat(elems);
++            c.pos = t.pos;
++            return c;
++        }
+         return M.at(t.pos).NewArray(elemtype, dims, elems);
+     }
+ 
+@@ -477,6 +487,11 @@ public JCTree visitTypeCast(TypeCastTree node, P p) {
+     @DefinedBy(Api.COMPILER_TREE)
+     public JCTree visitPrimitiveType(PrimitiveTypeTree node, P p) {
+         JCPrimitiveTypeTree t = (JCPrimitiveTypeTree) node;
++        if (t instanceof JCUnsignedTypeTree u) {
++            JCUnsignedTypeTree c = new JCUnsignedTypeTree(u.bits, u.raw);
++            c.pos = t.pos;
++            return c;
++        }
+         return M.at(t.pos).TypeIdent(t.typetag);
+     }
+ 
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeScanner.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeScanner.java
+index b9ae35da9..c3b3df306 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeScanner.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeScanner.java
+@@ -341,6 +341,7 @@ public void visitRecordPattern(JCRecordPattern that) {
+     public void visitIndexed(JCArrayAccess tree) {
+         scan(tree.indexed);
+         scan(tree.index);
++        if (tree instanceof JCSlice s) scan(s.lo);
+     }
+ 
+     public void visitSelect(JCFieldAccess tree) {
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeTranslator.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
+index 63778fb42..f5f81c5ce 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
+@@ -393,6 +393,7 @@ public void visitPatternCaseLabel(JCPatternCaseLabel tree) {
+     public void visitIndexed(JCArrayAccess tree) {
+         tree.indexed = translate(tree.indexed);
+         tree.index = translate(tree.index);
++        if (tree instanceof JCSlice s) s.lo = translate(s.lo);
+         result = tree;
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 9d88c9dd93fc3f7a089abb2846435ed44087f23d Mon Sep 17 00:00:00 2001
+From: Jyotiprakash Mishra <mail@jyotiprakash.org>
+Date: Fri, 23 Oct 2026 05:51:48 +0530
+Subject: [PATCH 2/2] Tessera javac: ulong casts to long keep the cast; ulong
+ to float/double is unsigned; positions on lowered trees
+
+Found by the Tessera javac test suite (tessera-eval/javac-tests): (long) of a
+ulong expression stayed ulong, (double) of a ulong converted it as signed, and
+errors on lowered trees were reported at line 1.
+---
+ .../com/sun/tools/javac/comp/TesseraSyntax.java | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
+index 4ca3e2715..fc7f8b7aa 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TesseraSyntax.java
+@@ -466,10 +466,23 @@ public void visitApply(JCMethodInvocation tree) {
+         @Override
+         public void visitTypeCast(JCTypeCast tree) {
+             super.visitTypeCast(tree);
++            make.at(tree.pos);
+             Type to = tree.type;
+             Type from = tree.expr.type;
++            if (isUnsigned(from) && from.getTag() == LONG && (to.hasTag(FLOAT) || to.hasTag(DOUBLE))) {
++                // a 64-bit unsigned value as floating point: through its decimal string, correctly rounded
++                JCExpression str = call(types.boxedClass(syms.longType).type, "toUnsignedString", List.of(syms.longType),
++                        List.of(tree.expr));
++                str.type = syms.stringType;
++                Type box = types.boxedClass(to).type;
++                result = call(box, to.hasTag(FLOAT) ? "parseFloat" : "parseDouble", List.of(syms.stringType), List.of(str));
++                result.type = to;
++                return;
++            }
+             if (isUnsigned(from) && !isUnsigned(to) && (to.hasTag(LONG) || to.hasTag(FLOAT) || to.hasTag(DOUBLE))) {
+-                result = coerce(tree.expr, to);
++                JCExpression c = coerce(tree.expr, to);
++                // a ulong cast to long keeps its bits: keep the cast, so the result is a signed long
++                result = c == tree.expr ? tree : c;
+                 return;
+             }
+             if (to instanceof UnsignedType u && u.bits != 32 && u.bits != 64 && from.isNumeric()) {
+@@ -483,6 +496,7 @@ public void visitTypeCast(JCTypeCast tree) {
+         @Override
+         public void visitUnary(JCUnary tree) {
+             super.visitUnary(tree);
++            make.at(tree.pos);
+             if (!(tree.type instanceof UnsignedType u)) return;
+             if (tree.hasTag(JCTree.Tag.COMPL) || tree.hasTag(JCTree.Tag.NEG)) result = masked(tree, u);
+         }
+@@ -519,6 +533,7 @@ public void visitExec(JCExpressionStatement tree) {
+         @Override
+         public void visitBinary(JCBinary tree) {
+             super.visitBinary(tree);
++            make.at(tree.pos);
+             Type lt = tree.lhs.type, rt = tree.rhs.type;
+             boolean ul = isUnsigned(lt), ur = isUnsigned(rt);
+             // string conversion of unsigned values
+-- 
+2.50.1 (Apple Git-155)
+

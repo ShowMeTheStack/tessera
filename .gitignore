@@ -1,0 +1,10 @@
+.gradle/
+build/
+out/
+*.vcd
+*.fst
+.idea/
+*.iml
+.DS_Store
+tessera-eval/browser/node_modules/
+__pycache__/

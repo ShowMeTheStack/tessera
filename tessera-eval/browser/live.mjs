@@ -1,0 +1,28 @@
+// Live details: a register's next value and hand-over; an FSM state tag by name. node live.mjs <url> <outdir>
+import { chromium } from 'playwright';
+const [url, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(url);
+await page.waitForTimeout(1500);
+await page.evaluate(() => localStorage.clear());
+await page.reload();
+await page.waitForTimeout(2000);
+await page.evaluate(() => Studio.app.sim({ cmd: 'reset' }));
+await page.evaluate(() => Studio.app.sim({ cmd: 'pause' }));
+await page.evaluate(() => Studio.app.sim({ cmd: 'poke', path: 'en', value: '1' }));
+await page.waitForTimeout(600);
+const rv = () => page.evaluate(() => [document.querySelector('.cv [data-regval]').textContent, document.querySelector('.cv [data-regnext]').textContent].join(' | '));
+console.log('paused, en=1:', await rv());
+await page.evaluate(() => Studio.app.sim({ cmd: 'step' }));
+await page.waitForTimeout(120);
+console.log('just stepped:', await rv(), 'handover', await page.evaluate(() => document.querySelector('.cv [data-regval]').classList.contains('handover')));
+await page.evaluate(() => Studio.app.sim({ cmd: 'poke', path: 'en', value: '0' }));
+await page.waitForTimeout(500);
+console.log('en=0:', await rv(), '(no next value while disabled)');
+await page.screenshot({ path: out + '/live-reg.png' });
+console.log(errors.length ? errors.join('\n') : 'no console errors');
+await browser.close();

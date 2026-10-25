@@ -1,0 +1,14 @@
+import { chromium } from 'playwright';
+import fs from 'node:fs';
+const [url, design, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+await page.goto(url);
+await page.waitForTimeout(1500);
+await page.evaluate((d) => Studio.app.openDesign(d), design);
+await page.waitForTimeout(1500);
+const prob = await page.evaluate(() => JSON.stringify(Studio.app.canvas.routeProblem()));
+fs.writeFileSync(out, prob);
+const z = await page.evaluate(() => JSON.stringify([Studio.app.canvas.view, Studio.app.canvas.bounds()]));
+console.log('view, bounds', z);
+await browser.close();

@@ -1,0 +1,46 @@
+/* The waveform dock under the canvas. */
+.dock { display: flex; flex-direction: column; min-height: 0; background: var(--panel); border-top: 1px solid var(--line); }
+.wv { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.wv-tools { display: flex; align-items: center; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); flex: none; }
+.wv-tools .wv-add { height: 26px; }
+.wv-tools .btn { height: 26px; }
+.wv-info { margin-left: 8px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wv-body { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: 220px 1fr; align-items: start; }
+.wv-names { border-right: 1px solid var(--line); position: sticky; left: 0; background: var(--panel); z-index: 1; }
+.wv-hd { display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; color: var(--faint); font-size: 11px; border-bottom: 1px solid var(--line); }
+.wv-name { display: flex; align-items: center; gap: 6px; padding: 0 6px 0 10px; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); cursor: grab; user-select: none; }
+.wv-name:hover { background: var(--panel2); }
+.wv-lb { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+.wv-val { max-width: 76px; overflow: hidden; text-overflow: ellipsis; color: var(--accent); font: 600 11.5px var(--mono); }
+.wv-radix { width: 34px; height: 18px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel2); color: var(--muted); font: 10.5px var(--mono); cursor: pointer; padding: 0; }
+.wv-radix:empty { visibility: hidden; }
+.wv-x { width: 18px; height: 18px; border: 0; border-radius: 4px; background: none; color: var(--faint); cursor: pointer; }
+.wv-x:hover { background: var(--bad-soft); color: var(--bad); }
+.wv-plot { position: relative; min-width: 0; cursor: crosshair; }
+.wv-cv { display: block; width: 100%; }
+.wv-empty { padding: 14px 10px; color: var(--muted); font-size: 12px; }
+.wv-name.sel { background: var(--accent-soft); }
+.wv-name.in-group { padding-left: 22px; }
+.wv-name.bit .wv-lb { color: var(--muted); }
+.wv-exp { width: 14px; height: 16px; flex: none; border: 0; background: none; color: var(--faint); font: 700 12px var(--mono); cursor: pointer; padding: 0; }
+.wv-exp:hover { color: var(--accent); }
+.wv-group { display: flex; align-items: center; gap: 4px; padding: 0 8px; background: var(--panel2); color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; cursor: pointer; user-select: none; border-bottom: 1px solid var(--line); }
+.wv-group .n { color: var(--faint); font-weight: 500; }
+.wv-notes { display: flex; gap: 6px; padding: 4px 8px; border-top: 1px solid var(--line); overflow-x: auto; flex: none; scrollbar-width: thin; }
+.wv-note { flex: none; height: 22px; padding: 0 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel2); color: var(--muted); font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.wv-note b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.wv-note.fail { border-color: var(--bad); color: var(--bad); }
+.wv-note.trace { border-color: var(--accent); }
+.wv-note.fork { border-color: var(--warn); }
+.wv-note.marker { border-color: var(--c4); }
+.wv-tip { position: absolute; display: none; max-width: 260px; padding: 5px 8px; border: 1px solid var(--line2); border-radius: 6px; background: var(--panel); box-shadow: var(--shadow); font-size: 12px; pointer-events: none; z-index: 2; }
+.wv-plot:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.wpick { max-height: 52vh; overflow: auto; margin-top: 6px; border: 1px solid var(--line); border-radius: 8px; }
+.wpick-g { position: sticky; top: 0; padding: 4px 10px; background: var(--panel2); color: var(--muted); font: 600 11px var(--mono); border-bottom: 1px solid var(--line); }
+.wpick-g .n { color: var(--faint); font-weight: 400; }
+.wpick-s { display: flex; justify-content: space-between; width: 100%; padding: 3px 10px 3px 22px; border: 0; background: none; color: var(--text); font: 12px var(--mono); cursor: pointer; text-align: left; }
+.wpick-s:hover { background: var(--accent-soft); }
+.wpick-s.on { color: var(--faint); cursor: default; }
+.wpick-s .t { color: var(--faint); }
+.wv-pat { width: 18px; height: 18px; border: 0; border-radius: 4px; background: none; color: var(--accent); cursor: pointer; font-size: 13px; }
+.wv-pat:hover { background: var(--accent-soft); }

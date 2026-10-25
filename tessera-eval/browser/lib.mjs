@@ -1,0 +1,26 @@
+// Library parts: palette shows them; place each and check the drawing. node lib.mjs <url> <outdir>
+import { chromium } from 'playwright';
+const [url, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(url);
+await page.waitForTimeout(1500);
+await page.evaluate(() => localStorage.clear());
+await page.reload();
+await page.waitForTimeout(2000);
+await page.evaluate(() => Studio.app.replace(Studio.Doc.blank('Lib')));
+await page.waitForTimeout(800);
+const types = ['counter', 'edge', 'delay', 'debounce', 'lfsr', 'bitop', 'onehot', 'prienc', 'fsm', 'mem', 'table'];
+const placed = await page.evaluate((types) => types.map((t, i) => { const p = Studio.app.placeAt(t, { x: 60 + (i % 4) * 220, y: 60 + Math.floor(i / 4) * 160 }); return p ? t + ':' + p.pins.length : t + ':FAIL'; }), types);
+console.log('placed', placed.join(' '));
+const cats = await page.evaluate(() => [...document.querySelectorAll('.pal h3')].map((e) => e.textContent.trim()).join(' | '));
+console.log('palette', cats);
+await page.waitForTimeout(1500);
+await page.evaluate(() => Studio.app.canvas.fit());
+await page.waitForTimeout(800);
+await page.screenshot({ path: out + '/lib.png' });
+console.log(errors.length ? errors.join('\n') : 'no console errors');
+await browser.close();

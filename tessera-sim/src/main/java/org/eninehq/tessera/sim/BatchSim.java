@@ -1,0 +1,464 @@
+package org.eninehq.tessera.sim;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import org.eninehq.tessera.ir.Circuit;
+import org.eninehq.tessera.ir.OpKind;
+import org.eninehq.tessera.ir.Signal;
+
+/**
+ * Bit-sliced simulation: 64 independent copies ("lanes") of a design in one pass. The netlist
+ * is bit-blasted into AND/OR/XOR/NOT/MUX gates over single bits; each gate operates on a
+ * {@code long} whose bit {@code i} belongs to lane {@code i}. Good for fuzzing: 64 random
+ * seeds per step at roughly the cost of a few single-lane steps. Memory reads are gathered
+ * lane by lane.
+ */
+public final class BatchSim {
+    public static final int LANES = 64;
+
+    private static final int AND = 0, OR = 1, XOR = 2, NOT = 3, MUX = 4, COPY = 5;
+    private static final OpKind[] KINDS = OpKind.values();
+
+    private final Netlist net;
+    /** Gate program: op, dst, a, b, c. */
+    private int[] gop = new int[1024], gdst = new int[1024], ga = new int[1024], gb = new int[1024], gc = new int[1024];
+    private int ngates;
+    /** Memory reads interleaved with gates: before gate index {@code at}, read memory {@code mem} into {@code data} bits. */
+    private record Read(int at, int mem, int[] addr, int[] data) {}
+    private final List<Read> reads = new ArrayList<>();
+    private final Map<Integer, int[]> slotBits = new HashMap<>();
+    private int nvars = 2; // 0 = all zero, 1 = all ones
+    private long[] v;
+    private final long[][][] mems; // [mem][lane][word]
+    private final int[][] regBits, regNext;
+    private final int[] regReset;
+    private final long[] regResetActive;
+    private final long[][] regResetWords;
+    private final Netlist.Reg[] regs;
+    private record Write(int mem, int[] addr, int[] data, int en) {}
+    private final List<Write> writes = new ArrayList<>();
+    private long cycle;
+
+    public BatchSim(Circuit c) {
+        this.net = Netlist.build(c);
+        // constants
+        long[] init = net.initialValues();
+        for (int slot = 0; slot < net.slotCount(); slot++) {
+            int w = net.slotWidth(slot);
+            if (w == 0) continue;
+            if (net.isConstant(slot)) {
+                int[] bits = new int[w];
+                for (int i = 0; i < w; i++) bits[i] = (init[slot + (i >>> 6)] >>> (i & 63) & 1) != 0 ? 1 : 0;
+                slotBits.put(slot, bits);
+            }
+        }
+        // registers and inputs get fresh variables; everything else comes from the instructions
+        for (var r : net.regs()) slotBits.put(r.slot(), fresh(r.width()));
+        for (var e : net.inputSlots().entrySet()) slotBits.putIfAbsent(e.getValue(), fresh(net.slotWidth(e.getValue())));
+        for (var in : net.insns()) blast(in);
+        // undriven slots (if any) stay zero
+        regs = net.regs().toArray(Netlist.Reg[]::new);
+        regBits = new int[regs.length][];
+        regNext = new int[regs.length][];
+        regReset = new int[regs.length];
+        regResetActive = new long[regs.length];
+        regResetWords = new long[regs.length][];
+        for (int i = 0; i < regs.length; i++) {
+            regBits[i] = slotBits.get(regs[i].slot());
+            regNext[i] = bits(regs[i].next(), regs[i].width());
+            regReset[i] = regs[i].hasReset() ? bits(regs[i].resetSlot(), 1)[0] : -1;
+            regResetActive[i] = regs[i].resetActive();
+            regResetWords[i] = regs[i].resetWords();
+        }
+        for (var w : net.memWrites())
+            writes.add(new Write(w.mem(), bits(w.addr(), net.slotWidth(w.addr())), bits(w.data(), net.mems().get(w.mem()).width()),
+                    bits(w.en(), 1)[0]));
+        v = new long[nvars];
+        v[1] = -1L;
+        mems = new long[net.mems().size()][LANES][];
+        for (int m = 0; m < mems.length; m++) {
+            var mem = net.mems().get(m);
+            for (int l = 0; l < LANES; l++) {
+                mems[m][l] = new long[mem.depth()];
+                if (mem.init() != null)
+                    for (int k = 0; k < mem.init().length; k++) mems[m][l][k] = mem.init()[k] & AbstractSim.mask(mem.width());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ bit blasting
+
+    private int[] fresh(int w) {
+        int[] b = new int[w];
+        for (int i = 0; i < w; i++) b[i] = nvars++;
+        return b;
+    }
+
+    private int[] bits(int slot, int w) {
+        int[] b = slotBits.get(slot);
+        if (b == null) {
+            b = new int[w]; // undriven: zero
+            slotBits.put(slot, b);
+        }
+        return b;
+    }
+
+    private int gate(int op, int a, int b, int c) {
+        // constant folding keeps the program small
+        switch (op) {
+            case AND -> {
+                if (a == 0 || b == 0) return 0;
+                if (a == 1) return b;
+                if (b == 1) return a;
+                if (a == b) return a;
+            }
+            case OR -> {
+                if (a == 1 || b == 1) return 1;
+                if (a == 0) return b;
+                if (b == 0) return a;
+                if (a == b) return a;
+            }
+            case XOR -> {
+                if (a == 0) return b;
+                if (b == 0) return a;
+                if (a == b) return 0;
+            }
+            case NOT -> {
+                if (a == 0) return 1;
+                if (a == 1) return 0;
+            }
+            case MUX -> {
+                if (a == 1) return b;
+                if (a == 0) return c;
+                if (b == c) return b;
+            }
+            default -> {}
+        }
+        if (ngates == gop.length) {
+            int n = gop.length * 2;
+            gop = Arrays.copyOf(gop, n);
+            gdst = Arrays.copyOf(gdst, n);
+            ga = Arrays.copyOf(ga, n);
+            gb = Arrays.copyOf(gb, n);
+            gc = Arrays.copyOf(gc, n);
+        }
+        int d = nvars++;
+        gop[ngates] = op;
+        gdst[ngates] = d;
+        ga[ngates] = a;
+        gb[ngates] = b;
+        gc[ngates] = c;
+        ngates++;
+        return d;
+    }
+
+    private int and(int a, int b) { return gate(AND, a, b, 0); }
+    private int or(int a, int b) { return gate(OR, a, b, 0); }
+    private int xor(int a, int b) { return gate(XOR, a, b, 0); }
+    private int not(int a) { return gate(NOT, a, 0, 0); }
+    private int mux(int s, int a, int b) { return gate(MUX, s, a, b); }
+
+    private int[] arg(Netlist.Insn in, int k, int w) {
+        int aw = in.argW()[k];
+        int[] a = bits(in.args()[k], aw);
+        int[] r = new int[w];
+        for (int i = 0; i < w; i++) r[i] = i < aw ? a[i] : (in.argS()[k] ? a[aw - 1] : 0);
+        return r;
+    }
+
+    private int[] add(int[] a, int[] b, int carry) {
+        int[] r = new int[a.length];
+        for (int i = 0; i < a.length; i++) {
+            int axb = xor(a[i], b[i]);
+            r[i] = xor(axb, carry);
+            carry = or(and(a[i], b[i]), and(carry, axb));
+        }
+        return r;
+    }
+
+    private int[] inv(int[] a) {
+        int[] r = new int[a.length];
+        for (int i = 0; i < a.length; i++) r[i] = not(a[i]);
+        return r;
+    }
+
+    /** a < b (unsigned): the borrow out of a - b. */
+    private int ltu(int[] a, int[] b) {
+        int carry = 1;
+        for (int i = 0; i < a.length; i++) {
+            int nb = not(b[i]);
+            int axb = xor(a[i], nb);
+            carry = or(and(a[i], nb), and(carry, axb));
+        }
+        return not(carry);
+    }
+
+    private int eq(int[] a, int[] b) {
+        int acc = 1;
+        for (int i = 0; i < a.length; i++) acc = and(acc, not(xor(a[i], b[i])));
+        return acc;
+    }
+
+    private void blast(Netlist.Insn in) {
+        int w = in.width();
+        int[] r;
+        if (in.op() == Netlist.MEMREAD) {
+            int[] addr = bits(in.args()[0], in.argW()[0]);
+            r = fresh(w);
+            reads.add(new Read(ngates, in.p0(), addr, r));
+            slotBits.put(in.dst(), r);
+            return;
+        }
+        switch (KINDS[in.op()]) {
+            case ADD -> r = add(arg(in, 0, w), arg(in, 1, w), 0);
+            case SUB -> r = add(arg(in, 0, w), inv(arg(in, 1, w)), 1);
+            case MUL -> {
+                int[] a = arg(in, 0, w), b = arg(in, 1, w);
+                r = new int[w];
+                for (int i = 0; i < w; i++) {
+                    int[] pp = new int[w];
+                    for (int j = 0; j < w; j++) pp[j] = j < i ? 0 : and(a[j - i], b[i]);
+                    r = add(r, pp, 0);
+                }
+            }
+            case AND, OR, XOR -> {
+                int[] a = arg(in, 0, w), b = arg(in, 1, w);
+                r = new int[w];
+                for (int i = 0; i < w; i++)
+                    r[i] = KINDS[in.op()] == OpKind.AND ? and(a[i], b[i]) : KINDS[in.op()] == OpKind.OR ? or(a[i], b[i]) : xor(a[i], b[i]);
+            }
+            case NOT -> r = inv(arg(in, 0, w));
+            case SHL -> {
+                int[] a = bits(in.args()[0], in.argW()[0]);
+                r = new int[w];
+                for (int i = 0; i < w; i++) r[i] = i < in.p0() ? 0 : a[i - in.p0()];
+            }
+            case SHR, SRA -> {
+                int aw = in.argW()[0];
+                int[] a = bits(in.args()[0], aw);
+                int fill = KINDS[in.op()] == OpKind.SRA ? a[aw - 1] : 0;
+                r = new int[w];
+                for (int i = 0; i < w; i++) r[i] = i + in.p0() < aw ? a[i + in.p0()] : fill;
+            }
+            case DSHL, DSHR, DSRA -> {
+                int aw = in.argW()[0];
+                int[] a = bits(in.args()[0], aw);
+                int[] s = bits(in.args()[1], in.argW()[1]);
+                boolean left = KINDS[in.op()] == OpKind.DSHL;
+                int fill = KINDS[in.op()] == OpKind.DSRA ? a[aw - 1] : 0;
+                int[] cur = a.clone();
+                int big = 0;
+                for (int k = 0; k < s.length; k++) {
+                    if (k >= 31 || (1L << k) >= aw) {
+                        big = or(big, s[k]);
+                        continue;
+                    }
+                    int sh = 1 << k;
+                    int[] shifted = new int[aw];
+                    for (int i = 0; i < aw; i++) {
+                        int src = left ? i - sh : i + sh;
+                        shifted[i] = src >= 0 && src < aw ? cur[src] : fill;
+                    }
+                    int[] next = new int[aw];
+                    for (int i = 0; i < aw; i++) next[i] = mux(s[k], shifted[i], cur[i]);
+                    cur = next;
+                }
+                r = new int[w];
+                for (int i = 0; i < w; i++) r[i] = mux(big, fill, cur[i]);
+            }
+            case EQ, NE, LT, LE, GT, GE -> {
+                int mw = Math.max(in.argW()[0], in.argW()[1]);
+                int[] a = arg(in, 0, mw), b = arg(in, 1, mw);
+                if (in.argS()[0]) { // signed: flip the sign bits and compare unsigned
+                    a = a.clone();
+                    b = b.clone();
+                    a[mw - 1] = not(a[mw - 1]);
+                    b[mw - 1] = not(b[mw - 1]);
+                }
+                int x = switch (KINDS[in.op()]) {
+                    case EQ -> eq(a, b);
+                    case NE -> not(eq(a, b));
+                    case LT -> ltu(a, b);
+                    case GE -> not(ltu(a, b));
+                    case GT -> ltu(b, a);
+                    default -> not(ltu(b, a));
+                };
+                r = new int[]{x};
+            }
+            case MUX -> {
+                int s = bits(in.args()[0], 1)[0];
+                int[] a = arg(in, 1, w), b = arg(in, 2, w);
+                r = new int[w];
+                for (int i = 0; i < w; i++) r[i] = mux(s, a[i], b[i]);
+            }
+            case CAT -> {
+                r = new int[w];
+                int pos = w;
+                for (int k = 0; k < in.args().length; k++) {
+                    int aw = in.argW()[k];
+                    pos -= aw;
+                    int[] a = bits(in.args()[k], aw);
+                    System.arraycopy(a, 0, r, pos, aw);
+                }
+            }
+            case SLICE -> {
+                int[] a = bits(in.args()[0], in.argW()[0]);
+                r = Arrays.copyOfRange(a, in.p1(), in.p1() + w);
+            }
+            case EXT, CAST -> r = arg(in, 0, w);
+            case ANDR, ORR, XORR -> {
+                int[] a = bits(in.args()[0], in.argW()[0]);
+                int acc = KINDS[in.op()] == OpKind.ANDR ? 1 : 0;
+                for (int x : a)
+                    acc = KINDS[in.op()] == OpKind.ANDR ? and(acc, x) : KINDS[in.op()] == OpKind.ORR ? or(acc, x) : xor(acc, x);
+                r = new int[]{acc};
+            }
+            default -> throw new IllegalStateException();
+        }
+        slotBits.put(in.dst(), r);
+    }
+
+    // ------------------------------------------------------------ running
+
+    /** Number of gates after bit-blasting. */
+    public int gateCount() { return ngates; }
+
+    private void eval() {
+        int ri = 0;
+        final long[] v = this.v;
+        for (int g = 0; g < ngates; g++) {
+            while (ri < reads.size() && reads.get(ri).at() == g) doRead(reads.get(ri++));
+            long a = v[ga[g]];
+            v[gdst[g]] = switch (gop[g]) {
+                case AND -> a & v[gb[g]];
+                case OR -> a | v[gb[g]];
+                case XOR -> a ^ v[gb[g]];
+                case NOT -> ~a;
+                case MUX -> (a & v[gb[g]]) | (~a & v[gc[g]]);
+                default -> a;
+            };
+        }
+        while (ri < reads.size()) doRead(reads.get(ri++));
+    }
+
+    private void doRead(Read rd) {
+        long[][] mem = mems[rd.mem()];
+        for (int k = 0; k < rd.data().length; k++) v[rd.data()[k]] = 0;
+        for (int lane = 0; lane < LANES; lane++) {
+            long addr = 0;
+            for (int k = 0; k < rd.addr().length && k < 63; k++) addr |= (v[rd.addr()[k]] >>> lane & 1) << k;
+            long word = Long.compareUnsigned(addr, mem[lane].length) < 0 ? mem[lane][(int) addr] : 0;
+            for (int k = 0; k < rd.data().length && k < 64; k++) v[rd.data()[k]] |= (word >>> k & 1) << lane;
+        }
+    }
+
+    private boolean dirty = true;
+
+    private void settle() {
+        if (dirty) {
+            eval();
+            dirty = false;
+        }
+    }
+
+    public void step() {
+        settle();
+        // next state, then memory writes, from the settled values
+        long[][] next = new long[regs.length][];
+        for (int i = 0; i < regs.length; i++) {
+            int[] nb = regNext[i];
+            long[] n = new long[nb.length];
+            long rst = regReset[i] < 0 ? 0 : (regResetActive[i] == 1 ? v[regReset[i]] : ~v[regReset[i]]);
+            for (int k = 0; k < nb.length; k++) {
+                long rv = (regResetWords[i][k >>> 6] >>> (k & 63) & 1) != 0 ? -1L : 0;
+                n[k] = (rst & rv) | (~rst & v[nb[k]]);
+            }
+            next[i] = n;
+        }
+        for (var w : writes) {
+            long en = v[w.en()];
+            if (en == 0) continue;
+            long[][] mem = mems[w.mem()];
+            for (int lane = 0; lane < LANES; lane++) {
+                if ((en >>> lane & 1) == 0) continue;
+                long addr = 0, data = 0;
+                for (int k = 0; k < w.addr().length && k < 63; k++) addr |= (v[w.addr()[k]] >>> lane & 1) << k;
+                for (int k = 0; k < w.data().length && k < 64; k++) data |= (v[w.data()[k]] >>> lane & 1) << k;
+                if (Long.compareUnsigned(addr, mem[lane].length) < 0) mem[lane][(int) addr] = data;
+            }
+        }
+        for (int i = 0; i < regs.length; i++) for (int k = 0; k < regBits[i].length; k++) v[regBits[i][k]] = next[i][k];
+        cycle++;
+        dirty = true;
+    }
+
+    public void step(int n) {
+        for (int i = 0; i < n; i++) step();
+    }
+
+    public long cycle() { return cycle; }
+
+    private int[] pathBits(String path) {
+        Signal s = net.signalsByPath().get(path);
+        if (s == null) throw new IllegalArgumentException("no signal " + path);
+        int slot = net.slotOf(s);
+        if (slot < 0) throw new IllegalArgumentException("signal " + path + " was optimized away");
+        return bits(slot, s.width());
+    }
+
+    /** Drive input {@code path} of one lane. */
+    public void poke(String path, int lane, long value) {
+        int[] b = inputBits(path);
+        for (int k = 0; k < b.length && k < 64; k++) {
+            long bit = 1L << lane;
+            if ((value >>> k & 1) != 0) v[b[k]] |= bit;
+            else v[b[k]] &= ~bit;
+        }
+        dirty = true;
+    }
+
+    /** Drive input {@code path} with the same value in every lane. */
+    public void pokeAll(String path, long value) {
+        int[] b = inputBits(path);
+        for (int k = 0; k < b.length && k < 64; k++) v[b[k]] = (value >>> k & 1) != 0 ? -1L : 0;
+        dirty = true;
+    }
+
+    private int[] inputBits(String path) {
+        Signal s = net.signalsByPath().get(path);
+        if (s == null || s.kind() != Signal.Kind.INPUT || s.owner() != net.circuit().top())
+            throw new IllegalArgumentException("can only poke top-level inputs, not " + path);
+        return pathBits(path);
+    }
+
+    /** The value of {@code path} in one lane (signals up to 64 bits). */
+    public long peek(String path, int lane) {
+        settle();
+        int[] b = pathBits(path);
+        long r = 0;
+        for (int k = 0; k < b.length && k < 64; k++) r |= (v[b[k]] >>> lane & 1) << k;
+        return r;
+    }
+
+    public BigInteger peekBig(String path, int lane) {
+        settle();
+        int[] b = pathBits(path);
+        BigInteger r = BigInteger.ZERO;
+        for (int k = b.length - 1; k >= 0; k--) r = r.shiftLeft(1).or(BigInteger.valueOf(v[b[k]] >>> lane & 1));
+        return r;
+    }
+
+    /** Memory contents of one lane. */
+    public long[] memory(String path, int lane) {
+        Integer i = net.memsByPath().get(path);
+        if (i == null) throw new IllegalArgumentException("no memory " + path);
+        dirty = true;
+        return mems[i][lane];
+    }
+
+    public Netlist netlist() { return net; }
+}

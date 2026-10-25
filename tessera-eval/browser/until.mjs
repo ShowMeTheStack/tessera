@@ -1,0 +1,36 @@
+// Run until a condition, then find it again in the waves. node until.mjs <url> <outdir>
+import { chromium } from 'playwright';
+const [url, out] = process.argv.slice(2);
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+const errors = [];
+page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(url);
+await page.waitForTimeout(1500);
+await page.evaluate(() => localStorage.clear());
+await page.reload();
+await page.waitForTimeout(2000);
+await page.evaluate(() => Studio.app.sim({ cmd: 'reset' }));
+await page.evaluate(() => Studio.app.sim({ cmd: 'pause' }));
+await page.evaluate(() => Studio.app.sim({ cmd: 'rate', rate: 1000 }));
+await page.evaluate(() => Studio.app.sim({ cmd: 'poke', path: 'en', value: '1' }));
+await page.locator('.cv').focus();
+await page.keyboard.press('u');
+await page.locator('.modal input').fill('count == 0x2a');
+await page.keyboard.press('Enter');
+await page.waitForTimeout(2000);
+console.log('stopped', await page.evaluate(() => [Studio.app.cycle, Studio.app.running, Studio.app.message].join(' | ')));
+const bad = await page.evaluate(async () => { try { await Studio.Api.call('sim', { cmd: 'until', expr: 'cnt == 3' }); return 'accepted'; } catch (e) { return e.message; } });
+console.log('bad name:', bad);
+// find in the waves: when count first was 0x10, from the start
+await page.evaluate(() => { Studio.app.waves.cursor = 0; });
+await page.locator('.wv-plot').focus();
+await page.keyboard.press('Meta+f');
+await page.locator('.modal input').fill('count == 16');
+await page.keyboard.press('Enter');
+await page.waitForTimeout(1200);
+console.log('found at', await page.evaluate(() => Studio.app.waves.cursor), 'canvas count =', await page.evaluate(() => document.querySelector('.cv [data-regval]').textContent));
+await page.screenshot({ path: out + '/until.png' });
+console.log(errors.length ? errors.join('\n') : 'no console errors');
+await browser.close();

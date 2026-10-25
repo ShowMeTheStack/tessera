@@ -1,0 +1,7 @@
+{
+  "name": "tessera-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "Tessera Studio in a real (headless Chromium) browser",
+  "devDependencies": { "playwright": "1.48.2" }
+}

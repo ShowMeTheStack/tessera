@@ -1,0 +1,27 @@
+# Tessera Studio front end, in load order: styles, then scripts.
+base.css
+app.css
+canvas.css
+waves.css
+pipeview.css
+ui.js
+api.js
+geom.js
+router.js
+parts.js
+doc.js
+tidy.js
+canvas.js
+palette.js
+inspector.js
+panels.js
+waves.js
+explore.js
+prove.js
+board.js
+analyse.js
+timing.js
+keys.js
+bench.js
+pipeview.js
+app.js
