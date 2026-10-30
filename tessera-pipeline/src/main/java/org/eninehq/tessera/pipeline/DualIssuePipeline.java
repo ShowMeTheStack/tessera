@@ -66,7 +66,7 @@ public final class DualIssuePipeline {
         int haltStage = m.haltStep == null ? -1 : Math.max(s.indexOf(m.haltStep), redirectStage);
 
         // two write ports: no FPGA RAM has those, so the register file is built from registers
-        m.regFile.asRegisters();
+        m.regFile.severalWritePorts();
         UInt pcReg = reg(name + "_pc", m.pcWidth, m.pcReset);
         Bool stopFetch = flag(name + "_stop_fetch");
         halted = flag(name + "_halted");
@@ -74,6 +74,7 @@ public final class DualIssuePipeline {
         Bool shiftPrev = flag(name + "_shift");
 
         p = Pipeline.begin(name, stopFetch.not());
+        Repairs repairs = Repairs.of(m, p, name);
         var believed = new ArrayList<Key<UInt>>();
         for (int i = 0; i <= resolves.size(); i++) believed.add(Key.of("(next pc guess " + i + ")"));
         Key<Bool> slotOk = Key.of("(slot valid)");
@@ -107,6 +108,9 @@ public final class DualIssuePipeline {
         f[0].step = f[1].step = "(pc)";
         f[0].put(m.pcKey, pc0);
         f[1].put(m.pcKey, pc1);
+        // with speculative state, slot 1's fire() says whether it is kept (fetch's updates of that state are gated with it)
+        Late<Bool> kept1 = repairs != null ? p.late(Bool.TYPE) : null;
+        if (kept1 != null) f[1].laneValid = kept1.get();
         for (String stepName : s.stepsIn(0, m.stepNames()))
             for (var c : f) {
                 c.step = stepName;
@@ -123,6 +127,8 @@ public final class DualIssuePipeline {
         f[1].put(slotOk, s1ok);
         // slot 0 guessed to jump: go there (slot 1 is dropped); a split keeps slot 1 for later: fetch from it again
         fetchNext.set(mux(s1ok, mux(split.get(), pc1, g[1]), g[0]));
+        // slot 1 is dropped behind a guessed jump in slot 0, and fetched again after a split
+        if (kept1 != null) kept1.set(s1ok.and(split.get().not()));
 
         // ---- the stages from the read stage on, one context per lane
         StepContext[] c = {ctx(m, s, 0), ctx(m, s, 1)};
@@ -163,6 +169,7 @@ public final class DualIssuePipeline {
                 deepFlush = deepFlush.named(name + "_deep_flush");
                 c[1].laneValid = lv1Raw.and(pairOk.get());
             }
+            c[1].entryValid = c[1].laneValid;
             for (String stepName : s.stepsIn(st, m.stepNames())) {
                 for (int l = 0; l < 2; l++) {
                     var cx = c[l];
@@ -204,6 +211,8 @@ public final class DualIssuePipeline {
                         redirects.get(ri).get(l).set(wrong);
                         targets.get(ri).get(l).set(nx);
                         p.flush(wrong);
+                        // the same priority as the pc mux: the latest resolve point, lane 0 before lane 1
+                        if (repairs != null) repairs.record(cx, ri, l, 2 * ri + (l == 0 ? 1 : 0), wrong, nx);
                         if (st >= 2) deep.get(deepNext++).set(wrong);
                         cx.step = "(resolve)";
                         cx.put(believed.get(ri + 1), mux(known, nx, was));
@@ -227,6 +236,9 @@ public final class DualIssuePipeline {
                 Bool waw = c[0].<Bool>get(m.issueWritesKey).and(c[1].get(m.issueWritesKey)).and(c[0].<UInt>get(m.rdKey).eq(c[1].get(m.rdKey)));
                 Bool ok = lv1Raw.and(c[1].get(m.lane1OkKey)).and(c[0].<Bool>get(m.serializesKey).not())
                         .and(raw.not()).and(waw.not()).and(stall[1].not()).and(wrong0Read.not());
+                // the model's own rules (a unit the lanes share): lane 0's key and lane 1's key split the pair
+                for (var pc : m.pairConflicts)
+                    ok = ok.and(c[0].<Bool>get(pc.older()).and(c[1].get(pc.younger())).not());
                 ok = ok.named(name + "_pair");
                 pairOk.set(ok);
                 Bool splitNow = p.valid().and(lv1Raw).and(ok.not()).and(wrong0Read.not()).named(name + "_split");
@@ -241,7 +253,8 @@ public final class DualIssuePipeline {
                 }
                 shiftPrev.set(mux(p.advancing(), splitNow, shiftPrev).and(deepFlush.not()));
                 report.add("pairing in " + s.stageNames().get(st) + ": lane 1 waits when it reads or writes lane 0's destination, when "
-                        + m.lane1OkKey + " is false, when " + m.serializesKey + " holds in lane 0, or when its operand is not ready");
+                        + m.lane1OkKey + " is false, when " + m.serializesKey + " holds in lane 0, or when its operand is not ready"
+                        + String.join("", m.pairConflicts.stream().map(x -> "; also when lane 0 has " + x.older() + " and lane 1 has " + x.younger()).toList()));
             }
             if (st == haltStage) {
                 Bool halt0 = c[0].<Bool>get(m.haltKey).and(c[0].valid());
@@ -265,7 +278,7 @@ public final class DualIssuePipeline {
                     prod.value().set((UInt) latest.value());
                     prod.ready().set((Bool) latest.ready());
                 } else {
-                    prod.value().set(UInt.lit(0, m.regFile.def().width()));
+                    prod.value().set(UInt.lit(0, m.regFile.width()));
                     prod.ready().set(Hw.FALSE);
                 }
                 if (prod.lane() == 0)
@@ -275,6 +288,7 @@ public final class DualIssuePipeline {
         }
         Bool done = c[0].<Bool>get(m.haltKey).and(c[0].valid()).or(c[1].<Bool>get(m.haltKey).and(c[1].valid()));
         when(done, () -> halted.set(true));
+        if (repairs != null) repairs.finish();
         p.end();
         probeSource = laneProbes(name, s, stages);
     }
@@ -302,7 +316,7 @@ public final class DualIssuePipeline {
         for (int j = readStage + 1; j <= writeStage; j++)
             for (int l = 1; l >= 0; l--)
                 out.add(new Producer(j, l, p.late(Bool.TYPE), p.late(UInt.w(m.regFile.addrWidth())),
-                        p.late(UInt.w(m.regFile.def().width())), p.late(Bool.TYPE)));
+                        p.late(UInt.w(m.regFile.width())), p.late(Bool.TYPE)));
         return out;
     }
 
@@ -312,7 +326,7 @@ public final class DualIssuePipeline {
         for (var port : m.readPorts) {
             UInt idx = ctx.get(port.index());
             UInt v = m.regFile.read(idx);
-            if (m.zeroRegister) v = mux(idx.eq(0), UInt.lit(0, m.regFile.def().width()), v);
+            if (m.zeroRegister) v = mux(idx.eq(0), UInt.lit(0, m.regFile.width()), v);
             Bool hazardFree = m.zeroRegister ? idx.ne(0) : Hw.TRUE;
             for (int k = producers.size() - 1; k >= 0; k--) {
                 var prod = producers.get(k);

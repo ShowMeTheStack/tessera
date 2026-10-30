@@ -8,7 +8,7 @@ set -e
 HOST=${ZED_HOST:-user@zed-host}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TAG=$1; N=$2; P=$3; shift 3
-R=tessera-zed/paths/$TAG
+R=tessera-builds/paths/$TAG
 ssh $HOST "sudo rm -rf $R && mkdir -p $R"
 for d in "$@"; do scp -q -r "$ROOT/tessera-fpga/build/qor/$d" $HOST:$R/; done
 scp -q "$ROOT/tessera-fpga/vivado/qor_paths.tcl" $HOST:$R/

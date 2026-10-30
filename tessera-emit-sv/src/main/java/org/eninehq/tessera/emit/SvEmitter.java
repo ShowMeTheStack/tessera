@@ -217,8 +217,11 @@ public final class SvEmitter {
                     if (p.kind() == Signal.Kind.OUTPUT)
                         decls.append("  logic ").append(range(p.width())).append(portNames.get(new PortKey(i, p))).append(";\n");
 
+            // a true dual-port RAM's read registers are written in its port blocks (see memory())
+            var portRegs = new HashSet<Signal>();
+            for (var mem : m.mems()) for (var p : mem.ports()) portRegs.add(p.rdata());
             for (var s : m.allSignals()) {
-                if (s.kind() == Signal.Kind.INPUT || s.driver() == null) continue;
+                if (s.kind() == Signal.Kind.INPUT || s.driver() == null || portRegs.contains(s)) continue;
                 feeds = s.name();
                 feedsLoc = s.loc();
                 String v = operand(s.driver());
@@ -283,6 +286,22 @@ public final class SvEmitter {
                     logic.append("    if (").append(en).append(") ").append(n).append('[').append(a).append("] <= ").append(d).append(";\n");
                 }
                 logic.append("  end\n");
+                return;
+            }
+            if (!mem.ports().isEmpty()) {
+                // a true dual-port RAM in the vendors' template: one block per port, each reading (read-first) and
+                // writing its own address. Plain `always`: SystemVerilog forbids two always_ff writing one variable
+                for (var p : mem.ports()) {
+                    feeds = mem.name();
+                    feedsLoc = p.write().loc();
+                    String en = operand(p.en()), we = operand(p.we()), a = operand(p.addr()), d = operand(p.data());
+                    logic.append("  always @(posedge ").append(names.get(p.write().domain().clock())).append(") begin\n")
+                            .append("    if (").append(en).append(") begin\n")
+                            .append("      if (").append(we).append(") ").append(n).append('[').append(a).append("] <= ").append(d).append(";\n")
+                            .append("      ").append(names.get(p.rdata())).append(" <= ").append(n).append('[').append(a).append("];\n")
+                            .append("    end\n")
+                            .append("  end\n");
+                }
                 return;
             }
             for (var w : mem.writes()) {

@@ -18,6 +18,19 @@ public final class Rv32iIss {
     public long retired;
     /** The external interrupt line (MEIP). */
     public boolean irq;
+    /** Receives every committed store: the word index and the merged word. */
+    public interface StoreSink {
+        void stored(int index, int word);
+    }
+
+    /** When not null, gets every committed store, in program order (co-simulation of side effects). */
+    public StoreSink stores;
+    /**
+     * When not null, the values of the CSRs only instructions and traps write (mstatus, mie, mtvec, mscratch, mepc,
+     * mcause, mtval) each time they change: after a trap or interrupt entry and after each instruction. mip follows the
+     * interrupt line and the counters count cycles, so they are left out.
+     */
+    public java.util.List<int[]> csrChanges;
 
     public Rv32iIss(int memWords, int[] image) {
         this(memWords, image, false);
@@ -57,6 +70,7 @@ public final class Rv32iIss {
             if (!eff.interrupt()) throw new IllegalStateException("the core took an interrupt the ISS cannot take at pc " + pc);
             csrs = eff.next();
             pc = eff.target();
+            logCsrs();
         }
         int inst = mem[index(pc)];
         var dec = Rv32i.decode(D, inst, zicsr);
@@ -84,7 +98,11 @@ public final class Rv32iIss {
             next = ex.nextPc();
             trap = ex.trap();
         }
-        if (store) mem[i] = Rv32i.storeMerge(D, dec.funct3(), ex.memAddr(), mem[i], x[dec.rs2()]);
+        if (store) {
+            mem[i] = Rv32i.storeMerge(D, dec.funct3(), ex.memAddr(), mem[i], x[dec.rs2()]);
+            if (stores != null) stores.stored(i, mem[i]);
+        }
+        if (zicsr) logCsrs();
         var r = new Retire(pc, inst, writes ? dec.rd() : 0, writes ? rdValue : 0);
         if (writes) x[dec.rd()] = rdValue;
         if (halt) halted = true;
@@ -92,6 +110,17 @@ public final class Rv32iIss {
         retired++;
         if (trap && !zicsr) halted = true;
         return r;
+    }
+
+    /** The CSR vector of {@link #csrChanges}. */
+    public static int[] csrVector(Zicsr.Csrs<Integer> c) {
+        return new int[]{c.mstatus(), c.mie(), c.mtvec(), c.mscratch(), c.mepc(), c.mcause(), c.mtval()};
+    }
+
+    private void logCsrs() {
+        if (csrChanges == null) return;
+        int[] v = csrVector(csrs);
+        if (csrChanges.isEmpty() || !java.util.Arrays.equals(csrChanges.getLast(), v)) csrChanges.add(v);
     }
 
     /** Run until halted or {@code maxSteps}; returns true if halted. */

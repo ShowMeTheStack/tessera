@@ -243,8 +243,8 @@ public final class ZedSuite {
             String s = summary(outcomes);
             System.out.print(s);
             System.out.printf("%.0f s%n", (System.nanoTime() - t0) / 1e9);
-            // batch builds (tessera-zed/pb/<flow>/<core>_<MHz>) are reported as <flow>-<core>_<MHz>
-            String run = dir.startsWith("tessera-zed/pb/") ? dir.substring("tessera-zed/pb/".length()).replace('/', '-') : Path.of(dir).getFileName().toString();
+            // batch builds (tessera-builds/pb/<flow>/<core>_<MHz>) are reported as <flow>-<core>_<MHz>
+            String run = dir.startsWith("tessera-builds/pb/") ? dir.substring("tessera-builds/pb/".length()).replace('/', '-') : Path.of(dir).getFileName().toString();
             Path report = Path.of("build/zed/" + run + "/board-report.txt");
             Files.createDirectories(report.getParent());
             var sb = new StringBuilder();

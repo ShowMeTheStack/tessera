@@ -1,0 +1,29 @@
+N07	unsigned int/long	uint as a type argument: there is no unsigned box type; List<@Unsigned Integer> is not checked
+N08	uint<N>	as P11
+N09	uint<N>	as P11
+N10	bits<N>	new type syntax
+N11	bits<N>	new type syntax
+N12	slices and bit select	as P20
+N13	slices and bit select	as P20
+N19	concatenation	as P22
+N20	ushort/ubyte	as P09
+P09	ushort/ubyte	the checker covers @Unsigned int and long only; 16/8-bit wrapping needs masking after every operation
+P10	ushort/ubyte	as P09
+P11	uint<N>	a width in the type needs javac's type system (new syntax)
+P12	uint<N>	as P11
+P13	uint<N>	as P11
+P14	uint<N>	as P11
+P15	uint<N>	as P11
+P16	uint<N>	as P11
+P20	slices and bit select	x[hi:lo] and x[i] on integers are parse/attribution errors in stock javac
+P21	slices and bit select	as P20
+P22	concatenation	{a, b} as an expression is a parse error in stock javac
+P23	concatenation	as P22
+P24	bits<N>	new type syntax
+P25	bits<N>	new type syntax
+P26	slices and bit select	as P20
+P44	unsigned int/long	ulong to double: no JDK method to lower to; ported as the negative test N30
+P50	operators on classes	a + b on a class is an attribution error before any plugin runs
+P51	operators on classes	as P50
+P52	trailing blocks	a block after a call is a parse error in stock javac
+P53	trailing blocks	as P52

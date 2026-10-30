@@ -3,10 +3,10 @@
 #   scripts/zed.sh build <core> [fclk_MHz]    emit SV here, build soc.bit/soc.xsa there
 #   scripts/zed.sh openxc7 <core> [fclk_MHz]  the same SoC with yosys + nextpnr-xilinx + prjxray there
 #   scripts/zed.sh xsct <script.tcl> [args]   run xsct (JTAG) there, in the build directory
-# ZED_HOST (default user@zed-host), ZED_DIR (default ~/tessera-zed on that host).
+# ZED_HOST (default user@zed-host), ZED_DIR (default ~/tessera-builds on that host).
 set -e
 HOST=${ZED_HOST:-user@zed-host}
-RDIR=${ZED_DIR:-tessera-zed}
+RDIR=${ZED_DIR:-tessera-builds}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 IMG=kkrizka/vivado:2020.1
 VIV="source /opt/Xilinx/Vivado/2020.1/settings64.sh; export DISPLAY=:99"

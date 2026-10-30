@@ -231,7 +231,8 @@
       const drawer = (side, ic, title) => button('', { icon: ic, title, className: 'narrow-only', onclick: () => { this.root.classList.toggle('show-' + side); this.root.classList.remove('show-' + (side === 'left' ? 'right' : 'left')); } });
       return h('header.toolbar', { role: 'toolbar', 'aria-label': 'Studio' },
         drawer('left', 'cpu', 'Parts'),
-        h('div.brand', h('span.logo'), 'Tessera Studio'), this.docName,
+        h('div.brand', { role: 'button', tabindex: '0', title: 'About Tessera', onclick: () => this.about(),
+          onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.about(); } } }, h('span.logo'), 'Tessera Studio'), this.docName,
         h('span.edit-group', { style: { display: 'contents' } },
         this.keyed(button('', { icon: 'file', title: 'New design', onclick: () => this.newDoc() }), 'New design', 'newDoc'),
         this.keyed(button('', { icon: 'open', title: 'Open a .java file', onclick: () => this.open() }), 'Open a .java file', 'open'),
@@ -337,8 +338,18 @@
       if (!list.length) { toast('No Java designs are registered (start the studio with --designs).'); return; }
       let progs = { cores: [], programs: [] };
       try { progs = await S.Api.call('programs', {}); } catch (e) { /* none */ }
+      // the main cores and registered designs first; each group of variant cores is a submenu
+      let groups = null;
+      try { groups = await S.Api.call('designGroups'); } catch (e) { /* an older server: one flat list */ }
       const r = anchor.getBoundingClientRect();
-      S.UI.menu(r.left, r.bottom + 4, list.map((n) => ({ label: n + (progs.cores.includes(n) && progs.programs.length ? ' …' : ''), action: () => (progs.cores.includes(n) && progs.programs.length ? this.chooseProgram(n, progs.programs) : this.openDesign(n)) })));
+      const item = (n) => ({ label: n + (progs.cores.includes(n) && progs.programs.length ? ' …' : ''), action: () => (progs.cores.includes(n) && progs.programs.length ? this.chooseProgram(n, progs.programs) : this.openDesign(n)) });
+      if (!groups || !groups.length) { S.UI.menu(r.left, r.bottom + 4, list.map(item)); return; }
+      const flat = groups.filter((g) => g.flat), sub = groups.filter((g) => !g.flat);
+      const shown = new Set(groups.flatMap((g) => g.designs));
+      const items = [...flat.flatMap((g) => g.designs.map(item)), ...list.filter((n) => !shown.has(n)).map(item)];
+      if (sub.length) items.push({ sep: true });
+      for (const g of sub) items.push({ label: g.group + ' (' + g.designs.length + ') ›', action: () => S.UI.menu(r.left, r.bottom + 4, g.designs.map(item)) });
+      S.UI.menu(r.left, r.bottom + 4, items);
     }
 
     // a core runs its benchmark loop, or a riscv-test (it passes when gp, x3, becomes 1 and the core halts)
@@ -1039,6 +1050,17 @@
 
     keysSheet() { this.keys.sheet(); }
 
+    // the attribution that the licence's section 7(b) term asks every copy to keep (NOTICE)
+    about() {
+      const link = (href, text) => h('a', { href, target: '_blank', rel: 'noopener' }, text);
+      S.UI.modal('About Tessera', h('div.about',
+        h('p', h('b', 'Tessera'), ', by Jyotiprakash Mishra (', link('https://github.com/ShowMeTheStack/tessera', 'github.com/ShowMeTheStack/tessera'), ')'),
+        h('p', 'Copyright (C) 2026 Jyotiprakash Mishra. Licensed under the GNU General Public License, version 3, with an additional ' +
+          'term under its section 7(b): this attribution must be kept in every copy and in works that contain Tessera. The Tessera ' +
+          'javac patch is under GPLv2 with the Classpath Exception. See LICENSE and NOTICE.'),
+        h('p.help', 'This program comes with ABSOLUTELY NO WARRANTY.')), { ok: 'Close' });
+    }
+
     // how often each drawn net changed lately, for the heat colouring (at most three times a second)
     async fetchActivity() {
       const now = performance.now();
@@ -1113,7 +1135,7 @@
         ...(this.designList || []).map((n) => ['Open design: ' + n, '', () => this.openDesign(n)]),
         ...S.Parts.all().map((t) => ['Add part: ' + t.title, '', () => this.placeAtCentre(t.type)]),
         ...((this.waves.signals && Object.keys(this.waves.signals)) || []).map((p) => ['Add to waves: ' + p, '', () => this.waves.add(p)]),
-        ['The guide', K('guide'), () => this.guide()],
+        ['The guide', K('guide'), () => this.guide()], ['About Tessera', '', () => this.about()],
         ...(this.guideSections || []).map((g) => ['Guide: ' + g.title, '', () => this.guide(g.id)]),
       ];
       const box = h('div.cmdk', { role: 'dialog', 'aria-label': 'Commands' });

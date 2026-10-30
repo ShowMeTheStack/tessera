@@ -60,6 +60,17 @@ public final class ZedBuild {
             case "C8": return 0x7E55_C800L;
             case "C9": return 0x7E55_C900L;
             case "C10": return 0x7E55_CA00L;
+            case "C11": return 0x7E55_CB00L;
+            // symmetric lanes
+            case "C9S": return 0x7E55_C951L;
+            case "C10S": return 0x7E55_CA51L;
+            case "C9S-REP": return 0x7E55_C952L;
+            case "C10S-REP": return 0x7E55_CA52L;
+            // C11 with the true dual-port data memory
+            case "C11-TDP": return 0x7E55_CB51L;
+            // and the live-value-table register file
+            case "C9-LVT": return 0x7E55_C953L;
+            case "C10-LVT": return 0x7E55_CA53L;
             default: break;
         }
         return switch (kind) {

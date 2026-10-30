@@ -40,7 +40,8 @@ public final class QorExport {
         for (var spec : org.eninehq.tessera.riscv.Cores.ALL)
             m.put("core_" + spec.id().toLowerCase(), () -> spec.build(1024, null));
         // where the multiply finishes, on C5 and C6 (Cores.MUL_VARIANTS)
-        for (var spec : java.util.stream.Stream.of(org.eninehq.tessera.riscv.Cores.MUL_VARIANTS, org.eninehq.tessera.riscv.Cores.PREDICT_VARIANTS)
+        for (var spec : java.util.stream.Stream.of(org.eninehq.tessera.riscv.Cores.MUL_VARIANTS, org.eninehq.tessera.riscv.Cores.PREDICT_VARIANTS,
+                        org.eninehq.tessera.riscv.Cores.OOO_VARIANTS, org.eninehq.tessera.riscv.Cores.SYMMETRIC_VARIANTS, org.eninehq.tessera.riscv.Cores.LVT_VARIANTS)
                 .flatMap(List::stream).toList())
             m.put("var_" + spec.id().toLowerCase().replace('-', '_'), () -> spec.build(1024, null));
         // parameter sweeps: every schedule with LUT RAM and block RAM; the out-of-order window

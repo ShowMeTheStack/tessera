@@ -25,7 +25,7 @@ tasks.register<JavaExec>("zedSuite") {
     val core = providers.gradleProperty("core").orElse("bram5").get()
     val flow = providers.gradleProperty("flow").orElse("vivado").get()   // vivado or openxc7
     args(providers.gradleProperty("zedHost").orElse("user@zed-host").get(),
-        providers.gradleProperty("zedDir").orElse(if (flow == "openxc7") "tessera-zed/$core-openxc7" else "tessera-zed/$core").get(), core,
+        providers.gradleProperty("zedDir").orElse(if (flow == "openxc7") "tessera-builds/$core-openxc7" else "tessera-builds/$core").get(), core,
         providers.gradleProperty("random").orElse("100").get(), providers.gradleProperty("slowdown").orElse("1").get(),
         if (providers.gradleProperty("keep").isPresent) "keep" else "program")
     workingDir = rootDir
@@ -55,4 +55,20 @@ tasks.register<JavaExec>("zedSuiteSim") {
     args(providers.gradleProperty("core").orElse("C5").get(), providers.gradleProperty("random").orElse("100").get())
     workingDir = rootDir
     maxHeapSize = "4g"
+}
+
+// ./gradlew :tessera-fpga:svHashes -PhashOut=<file>: SHA-256 of every experiment design's SystemVerilog
+tasks.register<JavaExec>("svHashes") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.eninehq.tessera.fpga.SvHashes")
+    jvmArgs("-Xss512m")
+    args(providers.gradleProperty("hashOut").getOrElse(layout.buildDirectory.file("sv-hashes.txt").get().asFile.path))
+}
+
+// Out-of-context designs of the generated cores and their references: ./gradlew :tessera-fpga:genQorExport -PgenQorOut=<dir>
+tasks.register<JavaExec>("genQorExport") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.eninehq.tessera.fpga.GenQorExport")
+    jvmArgs("-Xss512m")
+    args(providers.gradleProperty("genQorOut").getOrElse(layout.buildDirectory.dir("gen-qor").get().asFile.path))
 }

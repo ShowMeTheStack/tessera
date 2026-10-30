@@ -19,6 +19,28 @@ public final class StepContext {
     /** The issue lane (0 in a single-issue pipeline) and, in lane pipelines, whether this lane holds a real item. */
     int lane;
     Bool laneValid;
+    /**
+     * Out-of-order generation ({@link OutOfOrderPipeline}): where the body runs (a front-end stage, an execution unit,
+     * the head of the reorder buffer), in place of a {@link Pipeline}; null in the in-order generators.
+     */
+    Place place;
+    /** Out-of-order generation: values carried with the item (per-entry state), produced on first use; may be null. */
+    java.util.function.Function<Key<?>, Object> carried;
+
+    /** What a step body sees of the hardware place it runs in, when that place is not a {@link Pipeline} stage. */
+    interface Place {
+        Bool valid();
+
+        Bool advancing();
+
+        void stall(Bool cond);
+
+        <T extends org.eninehq.tessera.core.Data> T capture(T x);
+
+        <T extends org.eninehq.tessera.core.Data> T registered(T x);
+
+        String name();
+    }
 
     StepContext(InOrderModel model, Schedule schedule) {
         this.model = model;
@@ -28,6 +50,14 @@ public final class StepContext {
     @SuppressWarnings("unchecked")
     public <T> T get(Key<T> key) {
         Object v = values.get(key);
+        if (v == null && carried != null) {
+            v = carried.apply(key);
+            if (v != null) {
+                values.put(key, v);
+                producers.put(key, "(carried)");
+                order.add(key);
+            }
+        }
         if (v == null) {
             String by = model.producerOf(key);
             throw TesseraException.here("step '" + step + "' reads " + key + ", which "
@@ -55,16 +85,19 @@ public final class StepContext {
      * outside the pipeline (registers, inputs) are otherwise read live in whatever stage uses them.
      */
     public <T extends org.eninehq.tessera.core.Data> T capture(T x) {
+        if (place != null) return place.capture(x);
         return pipeline.input(x);
     }
 
     /** {@code x} comes out of a register clocked while this stage advances (a synchronous read): a next-stage value. */
     public <T extends org.eninehq.tessera.core.Data> T registered(T x) {
+        if (place != null) return place.registered(x);
         return pipeline.registered(x);
     }
 
     /** True when the current stage advances this cycle. */
     public Bool advancing() {
+        if (place != null) return place.advancing();
         return pipeline.advancing();
     }
 
@@ -73,16 +106,35 @@ public final class StepContext {
      * earlier stages hold, the next stage gets a bubble.
      */
     public void stall(Bool cond) {
+        if (place != null) {
+            place.stall(cond.and(place.valid()));
+            return;
+        }
         pipeline.stall(cond.and(pipeline.valid()));
     }
 
     /** True when the current stage holds a real item (in this lane). */
     public Bool valid() {
+        if (place != null) return place.valid();
         return laneValid == null ? pipeline.valid() : pipeline.valid().and(laneValid);
+    }
+
+    /** Lane 1's validity as its item entered the current stage (before lane 0's redirect here cancels it). */
+    Bool entryValid;
+
+    /**
+     * True when the current stage holds a real item in this lane as it entered the stage: in lane 1, before a
+     * redirect of lane 0 in the same stage cancels it. Lane 0's redirect waits for the stage to advance, so a stall
+     * condition must use this, not {@link #valid()}, or it would depend on itself.
+     */
+    public Bool validAtEntry() {
+        if (laneValid == null) return pipeline.valid();
+        return pipeline.valid().and(entryValid != null ? entryValid : laneValid);
     }
 
     /** True when the current stage holds a real item and advances this cycle: gate side effects with this. */
     public Bool fire() {
+        if (place != null) return place.valid().and(place.advancing());
         return laneValid == null ? pipeline.valid().and(pipeline.advancing()) : valid().and(pipeline.advancing());
     }
 
@@ -106,6 +158,7 @@ public final class StepContext {
 
     /** The name of the current stage. */
     public String stage() {
+        if (place != null) return place.name();
         return schedule.stageNames().get(pipeline.current());
     }
 }

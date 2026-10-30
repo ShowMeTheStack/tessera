@@ -85,15 +85,16 @@ class WorkloadTest {
         int[] img = image(workload);
         RvCore core = e.top();
         try (var sim = CoreRunner.sim(e)) {
-            long[] imem = sim.memory(core.imem), dmem = sim.memory(core.dmem), regs = sim.memory(core.regs);
+            long[] imem = sim.memory(core.imem), dmem = sim.memory(core.dmem);
             Arrays.fill(imem, 0);
             Arrays.fill(dmem, 0);
-            Arrays.fill(regs, 0);
+            CoreRunner.clearRegs(sim, core);
             for (int i = 0; i < img.length; i++) {
                 imem[i] = Integer.toUnsignedLong(img[i]);
                 dmem[i] = Integer.toUnsignedLong(img[i]);
             }
             var iss = new Rv32iIss(MEM, img, true);
+            var effects = new SideEffects(sim, core, iss);
             sim.reset(1);
             long start = sim.cycle(), retired = 0, t0 = -1, t1 = -1, r0 = 0, r1 = 0;
             long t = System.nanoTime();
@@ -110,10 +111,13 @@ class WorkloadTest {
                     if (got.insn() == STOP) { t1 = sim.cycle(); r1 = retired; }
                     retired++;
                 }
+                effects.sample();
                 sim.step();
             }
             double secs = (System.nanoTime() - t) / 1e9;
             assertTrue(iss.halted, "ISS did not halt");
+            effects.check(dmem);
+            long[] regs = CoreRunner.regs(sim, core);
             assertTrue(t0 >= 0 && t1 > t0, "markers not seen");
             String ok;
             if (workload.equals("coremark")) {

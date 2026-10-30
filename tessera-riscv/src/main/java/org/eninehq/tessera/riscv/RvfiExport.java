@@ -68,15 +68,38 @@ public final class RvfiExport {
             String n = "tessera_" + spec.id().toLowerCase();
             t.put(n, new Target(n, () -> spec.build(16, null), 12, 16));
         }
-        // branch prediction on C5's pipeline (Cores.PREDICT_VARIANTS): the BTB starts in any state
+        // symmetric lanes and the LVT register file (Cores.SYMMETRIC_VARIANTS, LVT_VARIANTS): channel 1 loads and stores too; depths as C9's
+        for (var spec : java.util.stream.Stream.of(Cores.SYMMETRIC_VARIANTS, Cores.LVT_VARIANTS).flatMap(java.util.List::stream).toList()) {
+            String n = "tessera_" + spec.id().toLowerCase().replace('-', '_');
+            t.put(n, new Target(n, () -> spec.build(16, null), 12, 16));
+        }
+        // branch prediction on C5's pipeline (Cores.PREDICT_VARIANTS): the BTB starts in any state, and so do gshare's history and
+        // counters and the return-address stack (C8-gshare, C8-ras, C8-gsras, C10-gsras: no reset, no initial contents)
         for (var spec : Cores.PREDICT_VARIANTS) {
             String n = "tessera_" + spec.id().toLowerCase().replace('-', '_');
             t.put(n, new Target(n, () -> spec.build(16, null), 12, 16));
         }
+        // a deliberately broken C8-gsras: execute trusts returns predicted by the RAS; with the RAS in any state, riscv-formal must find it
+        t.put("tessera_c8_gsras_bug_rastrusted", new Target("tessera_c8_gsras_bug_rastrusted", () -> new ScheduledCore(16, null,
+                ScheduledCore.FIVE_STAGE_MUL_SUM_WB, Cores.common(true), ScheduledCore.Predictor.btb(64).withGshare(8).withRas(8),
+                ScheduledCore.TestBug.RAS_TRUSTED), 12, 16));
         // C7 with the window riscv-formal can cover (4 ROB entries, 3 reservation stations), and the
         // board's 16/8 window to a bound
         t.put("tessera_c7", new Target("tessera_c7", () -> new OooCore(16, null, Cores.common(true), 4, 3), 14, 14));
         t.put("tessera_c7_16x8", new Target("tessera_c7_16x8", () -> new OooCore(16, null, Cores.common(true)), 14, 14));
+        // C11 (execute-time branch recovery and a load/store queue): the small window first (4 ROB entries, 3 reservation
+        // stations, 2 checkpoints, 2 loads, 2 stores), then the board's 16/8/4/4/4 window to a bound; C11-br (recovery
+        // alone, memory at the head) in the small window
+        t.put("tessera_c11", new Target("tessera_c11", () -> new OooSpecCore(16, null, Cores.common(true), 4, 3, 2, 2, 2), 14, 14));
+        t.put("tessera_c11_br", new Target("tessera_c11_br", () -> new OooSpecCore(16, null, Cores.common(true), 4, 3, 2), 14, 14));
+        // C11-tdp (C11 with the true dual-port data memory) in the small window
+        t.put("tessera_c11_tdp", new Target("tessera_c11_tdp", () -> new OooSpecCore(16, null, Cores.common(true), 4, 3, 2, 2, 2, true), 14, 14));
+        t.put("tessera_c11_16x8", new Target("tessera_c11_16x8", () -> Cores.get("C11").build(16, null), 14, 14));
+        // the generated out-of-order cores (GeneratedOooCore), the same windows and depths as C7
+        t.put("tessera_c7g", new Target("tessera_c7g", () -> new GeneratedOooCore(16, null, Cores.common(true), 4, 3), 14, 14));
+        t.put("tessera_c7g_16x8", new Target("tessera_c7g_16x8", () -> new GeneratedOooCore(16, null, Cores.common(true)), 14, 14));
+        t.put("tessera_c7g_er", new Target("tessera_c7g_er", () -> new GeneratedOooCore(16, null, Cores.common(true), 4, 3, true), 14, 14));
+        t.put("tessera_c7g_er_lsq", new Target("tessera_c7g_er_lsq", () -> new GeneratedOooCore(16, null, Cores.common(true), 4, 3, true, true), 14, 14));
         return t;
     }
 
@@ -142,8 +165,11 @@ public final class RvfiExport {
             cfg.append("csrw            ").append(d).append('\n');
             cfg.append("csr_ill         ").append(d).append('\n');
             cfg.append("csrc_upcnt 1    ").append(d).append('\n');
+            // read-after-write of the CSRs that only CSR instructions write (riscv-formal's shadow follows CSR
+            // instructions only, so CSRs that traps also write cannot be checked this way)
+            cfg.append("csrc_any 1      ").append(d).append('\n');
             cfg.append("\n[csrs]\n");
-            for (var c : RvCore.RVFI_CSRS) cfg.append(c.name()).append(c.wide() ? "    upcnt" : "").append('\n');
+            for (var c : RvCore.RVFI_CSRS) cfg.append(c.name()).append(c.wide() ? "    upcnt" : csrTest(c.name())).append('\n');
             cfg.append("\n[illegal_csrs]\nfff     msu     rw\n7c0     m       rw\nf11     m       w\n");
         }
         cfg.append("""
@@ -171,5 +197,15 @@ public final class RvfiExport {
             write(cores, t);
             System.out.println("wrote " + cores.resolve(t.name()));
         }
+    }
+
+    /** The riscv-formal CSR test of a 32-bit CSR: read-after-write ({@code any}, with the WARL mask) for those only CSR instructions write. */
+    static String csrTest(String name) {
+        return switch (name) {
+            case "mscratch" -> "    any";
+            case "mie" -> "    any_mask=32'h00000888";      // MEIE, MTIE, MSIE (Zicsr.java)
+            case "mtvec" -> "    any_mask=32'hfffffffc";    // direct mode: the two low bits read as 0
+            default -> "";
+        };
     }
 }

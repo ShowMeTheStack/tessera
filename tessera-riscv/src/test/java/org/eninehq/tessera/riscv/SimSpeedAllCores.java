@@ -11,6 +11,7 @@ import java.util.List;
 import org.eninehq.tessera.core.Elaborated;
 import org.eninehq.tessera.core.Tessera;
 import org.eninehq.tessera.sim.BatchSim;
+import org.eninehq.tessera.sim.CompiledSim;
 import org.eninehq.tessera.sim.Sim;
 import org.eninehq.tessera.test.Verilator;
 import org.junit.jupiter.api.Test;
@@ -20,6 +21,13 @@ import org.junit.jupiter.api.Test;
  * elaboration time, the compiled simulator's time to first cycle and steady-state rate, the
  * interpreter, the bit-sliced batch simulator (64 lanes) and Verilator (-O3, with its build
  * time). Run on an idle machine with {@code -Pbench}; writes build/results/simspeed.csv.
+ *
+ * <p>Warm-up: {@code compiled_hz} is a run timed after a warm-up run of the same design, and since
+ * simulators of one netlist share their generated classes, the warm-up warms the code that is timed.
+ * {@code compiled_hz_fresh_classes} repeats the measurement with class sharing off (every
+ * {@code Sim.create} defines new classes, so the warm-up warms other classes); it is reported next to
+ * the shared number, never instead of it. The interpreter is likewise timed after a warm-up run
+ * ({@code interpreter_hz}), and {@code interpreter_hz_no_warmup} is a single cold run.
  */
 class SimSpeedAllCores {
     static final int ITERATIONS = 200_000, SMALL = 5_000, BATCH_CYCLES = 20_000;
@@ -29,7 +37,8 @@ class SimSpeedAllCores {
         assumeTrue(Boolean.getBoolean("bench"), "run with -Pbench");
         int[] prog = Benchmarks.loop(ITERATIONS), small = Benchmarks.loop(SMALL);
         var rows = new ArrayList<String>(List.of(
-                "core,cycles,elaborate_ms,compiled_first_cycle_ms,compiled_hz,interpreter_hz,batch_gates,batch_lane_hz,verilator_build_s,verilator_hz"));
+                "core,cycles,elaborate_ms,compiled_first_cycle_ms,compiled_hz,interpreter_hz,batch_gates,batch_lane_hz,verilator_build_s,verilator_hz,"
+                        + "compiled_hz_fresh_classes,interpreter_hz_no_warmup"));
         // -Pcores: only those (variants included); otherwise every validation core
         var specs = System.getProperty("cores", "").isBlank() ? Cores.ALL : CoreMatrixTest.ids().stream().map(Cores::get).toList();
         for (var spec : specs) {
@@ -43,9 +52,17 @@ class SimSpeedAllCores {
                 sim.step();
             }
             double firstMs = (System.nanoTime() - t0) / 1e6;
-            SimSpeedBenchmark.tessera(e, Sim.Backend.COMPILED, ITERATIONS);                  // JIT warm-up
+            // the old way first: fresh classes for the warm-up and for the timed run
+            CompiledSim.setShareClasses(false);
+            SimSpeedBenchmark.tessera(e, Sim.Backend.COMPILED, ITERATIONS);
+            var compiledFresh = SimSpeedBenchmark.tessera(e, Sim.Backend.COMPILED, ITERATIONS);
+            CompiledSim.setShareClasses(true);
+            SimSpeedBenchmark.tessera(e, Sim.Backend.COMPILED, ITERATIONS);                  // JIT warm-up of the shared classes
             var compiled = SimSpeedBenchmark.tessera(e, Sim.Backend.COMPILED, ITERATIONS);
-            var interp = SimSpeedBenchmark.tessera(Tessera.elaborate(() -> spec.build(4096, small)), Sim.Backend.INTERPRETER, SMALL);
+            assertEquals(compiledFresh.cycles(), compiled.cycles(), "same cycle count with and without class sharing");
+            var smallE = Tessera.elaborate(() -> spec.build(4096, small));
+            var interpCold = SimSpeedBenchmark.tessera(smallE, Sim.Backend.INTERPRETER, SMALL);
+            var interp = SimSpeedBenchmark.tessera(smallE, Sim.Backend.INTERPRETER, SMALL);
             // 64 lanes of the bit-sliced simulator, a fixed number of cycles
             var batch = new BatchSim(e.circuit());
             batch.pokeAll("reset", 1);
@@ -65,8 +82,8 @@ class SimSpeedAllCores {
                 vb = String.format("%.1f", total - v.seconds());
                 vhz = String.format("%.0f", v.hz());
             }
-            rows.add(String.format("%s,%d,%.0f,%.0f,%.0f,%.0f,%d,%.0f,%s,%s", spec.id(), compiled.cycles(), elabMs, firstMs, compiled.hz(),
-                    interp.hz(), batch.gateCount(), laneHz, vb, vhz));
+            rows.add(String.format("%s,%d,%.0f,%.0f,%.0f,%.0f,%d,%.0f,%s,%s,%.0f,%.0f", spec.id(), compiled.cycles(), elabMs, firstMs,
+                    compiled.hz(), interp.hz(), batch.gateCount(), laneHz, vb, vhz, compiledFresh.hz(), interpCold.hz()));
             System.out.println("SPEED " + rows.getLast());
         }
         // -PsimspeedOut=<file> writes elsewhere than build/results

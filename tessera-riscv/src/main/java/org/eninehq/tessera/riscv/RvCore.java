@@ -7,6 +7,7 @@ import org.eninehq.tessera.core.Hw;
 import org.eninehq.tessera.core.Mem;
 import org.eninehq.tessera.core.Module;
 import org.eninehq.tessera.core.UInt;
+import org.eninehq.tessera.stdlib.LiveValueTable;
 
 /**
  * Common interface of the RV32I cores: Harvard memories initialised from the same image, a
@@ -83,6 +84,16 @@ public abstract class RvCore extends Module {
     }
 
     protected RvCore(int memWords, int[] image, Config config) {
+        this(memWords, image, config, false);
+    }
+
+    /**
+     * The register file as a live-value table ({@link LiveValueTable}): {@link #lvtRegs} instead of
+     * {@link #regs} (null then). The subclass declares its reads and writes and then closes it.
+     */
+    public final LiveValueTable lvtRegs;
+
+    protected RvCore(int memWords, int[] image, Config config, boolean lvt) {
         boolean zicsr = config.zicsr();
         this.zicsr = zicsr;
         this.irq = zicsr ? input("irq", Bool.TYPE) : null;
@@ -98,7 +109,8 @@ public abstract class RvCore extends Module {
         if (Integer.bitCount(memWords) != 1) throw new IllegalArgumentException("memWords must be a power of two");
         imem = mem("imem", UInt.w(32), memWords);
         dmem = mem("dmem", UInt.w(32), memWords);
-        regs = mem("regs", UInt.w(32), 32);
+        regs = lvt ? null : mem("regs", UInt.w(32), 32);
+        lvtRegs = lvt ? new LiveValueTable("regs", 32, 32, false) : null;
         if (image != null) {
             long[] init = new long[Math.min(image.length, memWords)];
             for (int i = 0; i < init.length; i++) init[i] = Integer.toUnsignedLong(image[i]);
@@ -108,7 +120,8 @@ public abstract class RvCore extends Module {
         addrBits = imem.addrWidth();
         if (dbg) {
             imem.write(dbgAddr, dbgWdata, dbgEn.and(dbgWe).and(dbgSelDmem.not()));
-            dbgRegData.set(regs.read(dbgAddr.width() >= 5 ? dbgAddr.bits(4, 0) : dbgAddr.zext(5)));
+            UInt ra = dbgAddr.width() >= 5 ? dbgAddr.bits(4, 0) : dbgAddr.zext(5);
+            dbgRegData.set(lvt ? lvtRegs.read(ra) : regs.read(ra));
         }
     }
 
@@ -133,6 +146,18 @@ public abstract class RvCore extends Module {
         }
         Bool host = dbgEn.and(dbgWe).and(dbgSelDmem);
         dmem.write(mux(dbgEn, dbgAddr, idx), mux(dbgEn, dbgWdata, data), mux(dbgEn, host, en));
+    }
+
+    /**
+     * One port of the data memory as a true dual-port RAM ({@link Mem#port}): {@code port} 0 or 1. With a debug port
+     * the host uses port 0 while {@code dbg_en} (the core is held in reset then). Returns the synchronous read.
+     */
+    protected UInt dmemPort(int port, UInt idx, Bool en, Bool we, UInt data) {
+        if (dbgEn == null || port == 1) return dmem.port(idx, en, we, data);
+        Bool host = dbgEn.and(dbgWe).and(dbgSelDmem);
+        UInt v = dmem.port(mux(dbgEn, dbgAddr, idx), en.or(dbgEn), mux(dbgEn, host, we), mux(dbgEn, dbgWdata, data));
+        dbgRdata.set(v);
+        return v;
     }
 
     /** Word index of a byte address (wraps around the memory size). */
@@ -228,8 +253,8 @@ public abstract class RvCore extends Module {
 
     static final int DIV_BITS_PER_CYCLE = 2;
 
-    /** A sequential divider's result, and whether the instruction must wait for it. */
-    protected record SeqDiv(UInt value, Bool stall) {}
+    /** A sequential divider's result, whether the instruction must wait for it, and the unit's control state (for proofs). */
+    protected record SeqDiv(UInt value, Bool stall, Bool busy, Bool done, UInt count) {}
 
     /**
      * The M result with division done by a small sequential unit (see {@link Config#seqDiv}):
@@ -269,7 +294,79 @@ public abstract class RvCore extends Module {
         Hw.when(advancing, () -> done.set(false));
         var finished = new Rv32i.MulDivHalf<>(h.a(), h.b(), h.funct3(), h.p00(), h.p01(), h.p10(), h.p11(),
                 rem, quo, dvd, h.divisor(), h.negQ(), h.negR(), h.byZero());
-        return new SeqDiv(divOnly ? Rv32i.divFinish(d, finished, 0) : Rv32i.mulDivFinish(d, finished, 0), want.and(done.not()));
+        return new SeqDiv(divOnly ? Rv32i.divFinish(d, finished, 0) : Rv32i.mulDivFinish(d, finished, 0), want.and(done.not()), busy, done, count);
+    }
+
+    /** The multiply/divide unit's result bus: its tag, value, operands, and its state (for proofs). */
+    protected record MdUnit(Bool bus, UInt value, UInt tag, UInt a, UInt b, UInt count, Bool isDiv) {}
+
+    /**
+     * The out-of-order core's multiply/divide unit: an issued operation's operands are captured; a multiply is on the bus the next cycle,
+     * a divide after 16 cycles of 2 restoring steps (count 0 to 32). {@code mdBusy} is made by the caller, which picks
+     * only while it is clear and clears it on a flush.
+     */
+    protected MdUnit mulDivUnit(Bool mdBusy, Bool mdIssue, UInt issueTag, UInt mInst, UInt mA, UInt mB, boolean zicsr) {
+        var d = HwDom.current();
+        var mHalf = Rv32i.mulDivStart(d, Rv32i.decode(d, mInst, zicsr), mA, mB, 0);
+        UInt mdTag = reg("md_tag", UInt.w(issueTag.width()), 0);
+        UInt mdCount = reg("md_count", UInt.w(6), 0);
+        Bool mdIsDiv = reg("md_div", Bool.TYPE, 0);
+        UInt[] mdRegs = new UInt[11];
+        String[] mdNames = {"a", "b", "funct3", "p00", "p01", "p10", "p11", "rem", "quo", "dividend", "divisor"};
+        UInt[] mdNow = {mHalf.a(), mHalf.b(), mHalf.funct3(), mHalf.p00(), mHalf.p01(), mHalf.p10(), mHalf.p11(),
+                mHalf.rem(), mHalf.quo(), mHalf.dividend(), mHalf.divisor()};
+        for (int k = 0; k < mdRegs.length; k++) mdRegs[k] = reg("md_" + mdNames[k], UInt.w(mdNow[k].width()), 0);
+        Bool mdNegQ = reg("md_neg_q", Bool.TYPE, 0), mdNegR = reg("md_neg_r", Bool.TYPE, 0), mdByZero = reg("md_by_zero", Bool.TYPE, 0);
+        Hw.when(mdIssue, () -> {
+            mdBusy.set(true);
+            mdTag.set(issueTag);
+            mdCount.set(0);
+            mdIsDiv.set(mInst.bit(14));
+            for (int k = 0; k < mdRegs.length; k++) mdRegs[k].set(mdNow[k]);
+            mdNegQ.set(mHalf.negQ());
+            mdNegR.set(mHalf.negR());
+            mdByZero.set(mHalf.byZero());
+        });
+        Hw.when(mdBusy.and(mdIsDiv).and(mdCount.ne(32)), () -> {
+            Object[] st = Rv32i.divSteps(d, mdRegs[7], mdRegs[8], mdRegs[9], mdRegs[10], 2);
+            mdRegs[7].set((UInt) st[0]);
+            mdRegs[8].set((UInt) st[1]);
+            mdRegs[9].set((UInt) st[2]);
+            mdCount.set(mdCount.addWrap(2));
+        });
+        // with riscv-formal's ALTOPS the result is a simple function of the operands: no iterations
+        Bool mdBus = (d.altops() ? mdBusy : mdBusy.and(mdIsDiv.not().or(mdCount.eq(32)))).named("md_bus");
+        UInt mdVal = Rv32i.mulDivFinish(d, new Rv32i.MulDivHalf<>(mdRegs[0], mdRegs[1], mdRegs[2], mdRegs[3], mdRegs[4],
+                mdRegs[5], mdRegs[6], mdRegs[7], mdRegs[8], mdRegs[9], mdRegs[10], mdNegQ, mdNegR, mdByZero), 0)
+                .named("md_value");
+        Hw.when(mdBus, () -> mdBusy.set(false));
+        return new MdUnit(mdBus, mdVal, mdTag, mdRegs[0], mdRegs[1], mdCount, mdIsDiv);
+    }
+
+    /** The multiply/divide unit's branch mask and whether this cycle cancels its operation (for proofs). */
+    protected record MdSquash(Bool[] mask, Bool cancel) {}
+
+    /**
+     * Branch-mask bookkeeping for {@link #mulDivUnit} in a core that squashes at execute ({@link OooSpecCore}): the
+     * operation in the unit carries the mask of the unresolved branches older than it ({@code issueMask} when it
+     * issues). When branch {@code branch} (one-hot) resolves, a {@code squash} cancels the operation only if the operation
+     * is younger than that branch (its mask bit is set), also when it issues in the same cycle; a correct resolution
+     * ({@code clear}) clears the bit. Call after {@link #mulDivUnit}, so the cancel overrides its issue.
+     */
+    protected MdSquash mulDivSquash(Bool mdBusy, Bool mdIssue, Bool[] issueMask, Bool squash, Bool clear, Bool[] branch) {
+        int n = issueMask.length;
+        Bool[] mask = new Bool[n];
+        for (int k = 0; k < n; k++) mask[k] = reg("md_bm" + k, Bool.TYPE, 0);
+        Bool younger = Bool.of(false);
+        for (int k = 0; k < n; k++) younger = younger.or(branch[k].and(mux(mdIssue, issueMask[k], mask[k])));
+        Bool cancel = squash.and(younger).named("md_cancel");
+        for (int k = 0; k < n; k++) {
+            final int b = k;
+            Hw.when(mdIssue, () -> mask[b].set(issueMask[b]));
+            Hw.when(clear.and(branch[b]), () -> mask[b].set(false));
+        }
+        Hw.when(cancel, () -> mdBusy.set(false));
+        return new MdSquash(mask, cancel);
     }
 
     /** Machine CSRs as registers, reset like {@link Zicsr#reset}. */

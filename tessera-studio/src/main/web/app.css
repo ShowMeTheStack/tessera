@@ -8,7 +8,8 @@
 .app.focus .side, .app.no-left .side.left, .app.no-right .side.right { overflow: hidden; visibility: hidden; }
 
 .toolbar { display: flex; align-items: center; gap: 4px; padding: 0 8px; border-bottom: 1px solid var(--line); background: var(--panel); min-width: 0; overflow-x: auto; scrollbar-width: none; }
-.toolbar .brand { display: flex; align-items: center; gap: 8px; margin-right: 6px; font-weight: 700; letter-spacing: .01em; white-space: nowrap; }
+.toolbar .brand { display: flex; align-items: center; gap: 8px; margin-right: 6px; font-weight: 700; letter-spacing: .01em; white-space: nowrap; cursor: pointer; }
+.about p { margin: 0 0 8px; max-width: 46em; }
 .toolbar .brand .logo { width: 18px; height: 18px; border-radius: 4px; background: conic-gradient(from 45deg, var(--accent), var(--c2), var(--c1), var(--accent)); }
 .toolbar .docname { height: 26px; border: 1px solid transparent; background: transparent; border-radius: 5px; padding: 0 6px; width: 150px; font-weight: 600; }
 .toolbar .docname:hover, .toolbar .docname:focus { border-color: var(--line2); background: var(--bg); outline: none; }

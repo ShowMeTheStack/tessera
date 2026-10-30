@@ -56,6 +56,10 @@ mut("rvcore-divearly", "M9 divider", INORDER, "RvCore.java",
 # ---- shared ISA semantics: the ISS is built from the same source
 mut("rv32i-sub", "M10 shared semantics", ["C5"], "Rv32i.java",
     "d.mux(sub, d.sub(a, opB), d.add(a, opB)),", "d.mux(sub, d.add(a, opB), d.add(a, opB)),", "SUB computes ADD (in the shared Rv32i, so also in the ISS)")
+mut("csr-mscratch-drop", "M10 shared semantics", ["C5"], "Zicsr.java",
+    "upd.apply((long) MSCRATCH, c.mscratch())", "c.mscratch()", "writes to mscratch are lost (in the shared Zicsr, so also in the ISS)")
+mut("csr-mie-mask", "M10 shared semantics", ["C5"], "Zicsr.java",
+    "d.and(value, d.k(0x888)), c.mie())", "d.and(value, d.k(0x880)), c.mie())", "mie.MSIE cannot be written (in the shared Zicsr, so also in the ISS)")
 
 # ---- C2: FiveStageCore, hazards written by hand
 F = "FiveStageCore.java"
@@ -189,6 +193,36 @@ mut("dual-rvfiorder", "M17 dual issue", DUALV, "tessera-riscv/src/main/java/org/
     "rvfi1.order().set(order.addWrap(n0));", "rvfi1.order().set(order);\n        rvfiOrder.set(order.addWrap(n1));",
     "RVFI: lane 1's instruction reported before lane 0's (order swapped)")
 
+# ---- symmetric lanes (loads and stores in lane 1, a true dual-port data memory) and the LVT register file
+SYMV = ["C9s", "C10s", "C9s-rep", "C10s-rep"]
+SPLITV, REPV, LVTV = ["C9s", "C10s"], ["C9s-rep", "C10s-rep"], ["C9-lvt", "C10-lvt"]
+SC = "ScheduledCore.java"
+mut("sym-nosplit", "M17 dual issue", SPLITV, SC,
+    "if (lane1Memory == Lane1Memory.SPLIT) m = m.splitPairWhen(MEM_STORE, MEM_ACCESS);", "",
+    "symmetric lanes: a store in lane 0 and a load or store in lane 1 issue together (no pair rule)")
+mut("sym-noreplay", "M17 dual issue", REPV, SC,
+    "                        replay = replay.or(same.named(\"lane1_same_word\"));\n", "",
+    "symmetric lanes: lane 1 is not replayed when lane 0 stores to the word it accesses")
+mut("sym-replaywrite", "M17 dual issue", REPV, SC,
+    "ex.writesRd().and(replay.not()) : ex.writesRd()", "ex.writesRd() : ex.writesRd()",
+    "symmetric lanes: a replayed lane-1 load still writes its register (a bug found during development)")
+mut("sym-bypass1", "M17 dual issue", SYMV, SC,
+    "for (int k = 0; k < 2; k++) word = mux(symLastValid", "for (int k = 0; k < 1; k++) word = mux(symLastValid",
+    "symmetric lanes: the store bypass has lane 0's entry only")
+mut("sym-noportwait", "M17 dual issue", SYMV, SC,
+    "c.stall(sel.and(reads).and(c.validAtEntry())", "c.stall(Bool.of(false).and(reads).and(c.validAtEntry())",
+    "symmetric lanes: a read in execute does not wait while its lane's port serves the store in memory")
+mut("sym-bypasshold", "M17 dual issue", SYMV, SC,
+    "        when(c.advancing(), () -> {\n            lv.set(storing);", "        when(Bool.of(true), () -> {\n            lv.set(storing);",
+    "symmetric lanes: the bypass entries change while memory is held (a lane-1 load beside a lane-0 divide loses its hit)")
+mut("lvt-notable", "M17 dual issue", LVTV, "tessera-stdlib/src/main/java/org/eninehq/tessera/stdlib/LiveValueTable.java",
+    "table.write(p.addr(), UInt.lit(w, sel), enable(p));", "table.write(p.addr(), UInt.lit(0, sel), enable(p));",
+    "LVT register file: the table never records lane 1 as the last writer (reads miss lane 1's writes)")
+mut("lvt-order", "M17 dual issue", LVTV, "tessera-stdlib/src/main/java/org/eninehq/tessera/stdlib/LiveValueTable.java",
+    "for (int w = 0; w < writes.size(); w++) {\n                var p = writes.get(w);\n                table.write(",
+    "for (int w = writes.size() - 1; w >= 0; w--) {\n                var p = writes.get(w);\n                table.write(",
+    "LVT register file: lane 0 wins a same-cycle write of one register (expected to survive: the pair check never issues WAW pairs)")
+
 # ---- C7: OooCore
 O = "OooCore.java"
 mut("c7-wakeval", "M1 forwarding", ["C7"], O,
@@ -209,7 +243,8 @@ mut("c7-csrcommit", "M7 CSR update timing", ["C7"], O,
     "updateCsrs(csrs, eff.next(), turn);", "updateCsrs(csrs, eff.next(), ready);", "CSRs updated in every cycle the head is ready")
 mut("c7-intr", "M8 interrupt marker", ["C7"], O,
     "when(turn.and(eff.interrupt()), () -> intrNext.set(true));", "", "rvfi_intr never set")
-mut("c7-divearly", "M9 divider", ["C7"], O,
+# the OoO multiply/divide unit is RvCore.mulDivUnit, shared by C7 and C11
+mut("c7-divearly", "M9 divider", ["C7"], "tessera-riscv/src/main/java/org/eninehq/tessera/riscv/RvCore.java",
     "Bool mdBus = (d.altops() ? mdBusy : mdBusy.and(mdIsDiv.not().or(mdCount.eq(32)))).named(\"md_bus\");",
     "Bool mdBus = (d.altops() ? mdBusy : mdBusy.and(mdIsDiv.not().or(mdCount.eq(30)))).named(\"md_bus\");",
     "the divider delivers its result one step early")
@@ -217,6 +252,72 @@ mut("c7-rat", "M13 rename table", ["C7"], O,
     "when(commit.and(cWrites).and(cRd.eq(x)).and(ratTag[x].eq(head)), () -> ratBusy[x].set(false));",
     "when(commit.and(cWrites).and(cRd.eq(x)), () -> ratBusy[x].set(false));", "commit clears a rename that a younger instruction made")
 
+# ---- C11: OooSpecCore (execute-time branch recovery)
+X = "OooSpecCore.java"
+mut("c11-rs-nosquash", "M18 lost squash", ["C11"], X,
+    "when(recover.and(younger(sMask[k], resBit)), () -> sValid[k].set(false));", "",
+    "a mispredict does not squash the younger reservation stations")
+mut("c11-rob-nosquash", "M18 lost squash", ["C11"], X,
+    "when(recover.and(younger(rMask[e], resBit)), () -> rValid[e].set(false));", "",
+    "a mispredict does not invalidate the younger ROB entries (only the tail moves)")
+mut("c11-md-nocancel", "M18 lost squash", ["C11"], "RvCore.java",
+    "Bool cancel = squash.and(younger).named(\"md_cancel\");", "Bool cancel = Bool.of(false).named(\"md_cancel\");",
+    "a mispredict does not cancel a younger multiply/divide")
+mut("c11-md-cancelall", "M18 lost squash", ["C11"], "RvCore.java",
+    "Bool cancel = squash.and(younger).named(\"md_cancel\");", "Bool cancel = squash.named(\"md_cancel\");",
+    "a mispredict cancels the multiply/divide even when it is older than the branch")
+mut("c11-cp-neighbour", "M19 checkpoint restore", ["C11"], X,
+    "Bool cBusy = pickB(aCp, busyCol);\n            UInt cTag = pick(aCp, tagCol);",
+    "Bool cBusy = pickB(aCp.addWrap(1), busyCol);\n            UInt cTag = pick(aCp.addWrap(1), tagCol);",
+    "the RAT is restored from the neighbouring checkpoint (index off by one)")
+mut("c11-tail-branch", "M19 checkpoint restore", ["C11"], X,
+    "tail.set(aTag.addWrap(1));", "tail.set(aTag);", "the ROB tail is restored to the branch, not the branch + 1 (off by one)")
+mut("c11-cp-before-rename", "M19 checkpoint restore", ["C11"], X,
+    "cpBusy[cc][r].set(ratBusy[r].or(own));\n                    cpTag[cc][r].set(mux(own, tail, ratTag[r]));",
+    "cpBusy[cc][r].set(ratBusy[r]);\n                    cpTag[cc][r].set(ratTag[r]);",
+    "the checkpoint is the RAT before the branch's own rename (a JALR's link register is lost: one instruction early)")
+mut("c11-restore-stale", "M19 checkpoint restore", ["C11"], X,
+    "ratBusy[x].set(cBusy.and(inFlight));", "ratBusy[x].set(cBusy);",
+    "the restored RAT keeps renames by instructions that committed after the checkpoint")
+mut("c11-mask-noclear", "M20 branch mask", ["C11"], X,
+    "                for (int i = 0; i < ROB; i++) rMask[i][b].set(false);\n                for (int j = 0; j < RS; j++) sMask[j][b].set(false);\n",
+    "", "a correctly predicted branch frees its checkpoint but leaves its bit in the ROB and RS masks")
+mut("c11-cp-noyounger", "M18 lost squash", ["C11"], X,
+    "when(recover.and(resBit[c].or(younger(cpMask[c], resBit))), () -> cpValid[cc].set(false));",
+    "when(recover.and(resBit[c]), () -> cpValid[cc].set(false));",
+    "a mispredict frees its own checkpoint but not those of the younger (squashed) branches")
+# the load/store queue (stage 2)
+mut("c11-lq-nosquash", "M18 lost squash", ["C11"], X,
+    "when(recover.and(younger(lMask[l], resBit)), () -> lValid[ll].set(false));", "",
+    "a mispredict does not squash the younger loads in the load queue")
+mut("c11-sq-nosquash", "M18 lost squash", ["C11"], X,
+    "when(recover.and(younger(qMask[q], resBit)), () -> qValid[qq].set(false));", "",
+    "a mispredict does not squash the younger stores in the store queue")
+mut("c11-fwd-partial", "M21 forwarding", ["C11"], X,
+    "covered = covered.or(youngest.and(covers));", "covered = covered.or(youngest);",
+    "a store forwards to a load even if it writes only some of the bytes the load reads")
+mut("c11-fwd-oldest", "M21 forwarding", ["C11"], X,
+    "youngest = youngest.and(match[o].and(qAge[o].gt(qAge[q])).not());", "youngest = youngest.and(match[o].and(qAge[o].lt(qAge[q])).not());",
+    "the oldest older store to the word forwards, not the youngest")
+mut("c11-ld-unknown", "M22 memory order", ["C11"], X,
+    "unknown = unknown.or(older.and(qAddrOk[q].not()));", "",
+    "a load goes before an older store's address is known")
+mut("c11-port-shared", "M22 memory order", ["C11"], X,
+    "return new Words(w, w, commitEn.not());", "return new Words(w, w, Bool.of(true));",
+    "a load is granted the read port in a cycle the commit reads it")
+
+# C11-tdp: the true dual-port data memory (port A loads, port B the commit)
+mut("c11tdp-store-early", "M22 memory order", ["C11-tdp"], X,
+    "UInt b = core.dmemPort(1, commitIdx, commitEn.or(we), we, wdata);",
+    "UInt b = core.dmemPort(1, commitIdx, commitEn.or(we), commitEn.or(we), wdata);",
+    "port B also writes in the cycle a byte or halfword store reads its word, before it commits (a stale merge)")
+mut("c11tdp-load-portb", "M22 memory order", ["C11-tdp"], X,
+    "return new Words(b, a, Bool.of(true));", "return new Words(b, b, Bool.of(true));",
+    "speculative loads take their word from port B (the commit's) instead of port A")
+mut("c11-sq-early-free", "M22 memory order", ["C11", "C11-tdp"], X,
+    "when(commit.and(qValid[q]).and(qTag[q].eq(head)), () -> qValid[qq].set(false));",
+    "when(ready.and(qValid[q]).and(qTag[q].eq(head)), () -> qValid[qq].set(false));",
+    "a store leaves the store queue when it is ready at the head, before it writes (a later load reads the old word)")
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, **kw)
@@ -248,10 +349,13 @@ def cosim(m):
             name = t.group(1)
             if not re.search(r"\b" + c + r"\b", name):
                 continue
-            if "seed" in name: suites.add("random")
+            if " branches " in name: suites.add("branches")
+            elif " memory " in name: suites.add("memory")
+            elif "seed" in name: suites.add("random")
             elif "rv32u" in name: suites.add("riscv-tests")
             elif re.search(r"-01\b", name): suites.add("arch-test")
             elif name.endswith(" zicsr"): suites.add("zicsr")
+            elif name.endswith(" directed"): suites.add("directed")
             elif name.endswith(" lint"): suites.add("lint")
             else: suites.add("other")
         cpi = re.search(r"MATRIX " + c + r" riscv-tests: \d+ cycles, \d+ retired, CPI ([\d.]+)", xml)
@@ -285,8 +389,11 @@ def formal(dst, jobs, timeout):
     if isinstance(dst, str):
         return dst
     subprocess.run(["python3", "../../checks/genchecks.py"], cwd=dst, capture_output=True)
+    # sby from $TESSERA_TOOLS/sby-install/bin (default ~/tessera-tools) or PATH, as in formal_bg.py; the solver shims go first
+    tools = Path(os.environ.get("TESSERA_TOOLS", Path.home() / "tessera-tools"))
+    env = dict(os.environ, PATH=f"{ROOT / 'scripts/solver-shims'}:{tools / 'sby-install/bin'}:{os.environ['PATH']}")
     proc = subprocess.Popen(["make", "-C", "checks", f"-j{jobs}", "-k"], cwd=dst, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.DEVNULL, start_new_session=True, env=env)
     start = time.time()
     result = None
     while result is None:
@@ -296,7 +403,9 @@ def formal(dst, jobs, timeout):
             result = "FAIL " + sorted(fails)[0] + f" ({time.time() - start:.0f}s)"
         elif proc.poll() is not None:
             st = [Path(s).read_text().split()[0] for s in glob.glob(str(dst / "checks/*/status"))]
-            result = f"PASS {st.count('PASS')}/{len(st)} ({time.time() - start:.0f}s)"
+            # no verdict at all means the checks never ran (no sby, a broken export): not a pass
+            result = (f"PASS {st.count('PASS')}/{len(st)} ({time.time() - start:.0f}s)" if st
+                      else f"ERROR no check ran (make exit {proc.returncode})")
         elif time.time() - start > timeout:
             st = [Path(s).read_text().split()[0] for s in glob.glob(str(dst / "checks/*/status"))]
             result = f"TIMEOUT {st.count('PASS')} passed after {timeout}s"
@@ -333,7 +442,10 @@ def main():
             m = dict(m, cores=[c for c in m["cores"] if c in only])
             if not m["cores"]:
                 continue
-        if do_formal and not do_cosim and "--redo" not in args and all(rows.get((m["id"], c), {}).get("formal") for c in m["cores"]):
+        def has_formal(c):  # a verdict, not an error or a run in which no check ran
+            v = rows.get((m["id"], c), {}).get("formal", "")
+            return v and not v.startswith(("ERROR", "PASS 0/0"))
+        if do_formal and not do_cosim and "--redo" not in args and all(has_formal(c) for c in m["cores"]):
             continue  # resume: already has formal results
         LOCK.write_text(m["id"])
         original = apply(m)
@@ -355,7 +467,7 @@ def main():
                     row["cosim"] = "caught: " + " ".join(suites) if suites else "survived"
                     row["cpi_riscv_tests"] = cpi
             if do_formal:
-                row["formal"] = formal(exported[core], jobs, 3600 if core == "C7" else 1800)
+                row["formal"] = formal(exported[core], jobs, 3600 if core in ("C7", "C11") else 1800)
             rows[key] = row
             print(m["id"], core, row.get("cosim", ""), "|", row.get("formal", ""), flush=True)
             save(rows)

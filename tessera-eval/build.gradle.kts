@@ -28,4 +28,11 @@ tasks.register<JavaExec>("errorCorpus") {
 tasks.test {
     // LibraryProofs on some properties only: -Pproofs=fifo
     systemProperty("proofs", providers.gradleProperty("proofs").getOrElse(""))
+    // LvtProofs results: -Plvtproofs=<csv>
+    systemProperty("lvtproofs", providers.gradleProperty("lvtproofs").getOrElse(""))
+    providers.gradleProperty("lvtproofs.solver").orNull?.let { systemProperty("lvtproofs.solver", it) }
+    providers.gradleProperty("lvtproofs.size").orNull?.let { systemProperty("lvtproofs.size", it) }
+    providers.gradleProperty("lvtproofs.width").orNull?.let { systemProperty("lvtproofs.width", it) }
+    providers.gradleProperty("lvtproofs.indsolver").orNull?.let { systemProperty("lvtproofs.indsolver", it) }
+    providers.gradleProperty("lvtproofs.skipbmc").orNull?.let { systemProperty("lvtproofs.skipbmc", it) }
 }

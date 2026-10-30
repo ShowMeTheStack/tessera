@@ -76,6 +76,38 @@ class MultiClockTest {
         assertEquals(fNow, last(s, "fast_out"));
     }
 
+    /**
+     * The Prove pane on a drawing with two clocks. The two counters are claimed equal, which holds only if the
+     * clocks tick together; the prover's clocks are independent, so it fails, and the counterexample replays with the
+     * prover's clock edges (with every clock stepping, the counters would still be equal at the failing cycle).
+     */
+    @Test
+    void provePaneUsesIndependentClocks() {
+        var d = new D("LockStep")
+                .part("c", "domain", "name", "clock", "period", 1, "phase", 0)
+                .part("f", "domain", "name", "fast", "period", 1, "phase", 0)
+                .part("rs", "reg", "name", "count", "width", 8, "init", "0")
+                .part("ks", "const", "value", "1", "width", 8)
+                .part("as", "add", "mode", "wrap")
+                .part("rf", "reg", "name", "fcount", "width", 8, "init", "0", "domain", "fast")
+                .part("kf", "const", "value", "1", "width", 8)
+                .part("af", "add", "mode", "wrap")
+                .part("os", "out", "name", "slow_out", "width", 8)
+                .part("of", "out", "name", "fast_out", "width", 8)
+                .part("eq", "cmp", "op", "eq")
+                .part("ok", "assert", "name", "lock_step")
+                .net("n1", "rs.q", "as.a", "os.a", "eq.a").net("n2", "ks.y", "as.b").net("n3", "as.y", "rs.d")
+                .net("m1", "rf.q", "af.a", "of.a", "eq.b").net("m2", "kf.y", "af.b").net("m3", "af.y", "rf.d")
+                .net("e1", "eq.y", "ok.cond");
+        var s = new Session(new Elaborator(List.of(), 1000));
+        var r = s.load(d.doc);
+        assertEquals(true, r.get("elaborated"), r + "\n" + CodeGen.generate(d.doc).java());
+        var p = s.prove(Map.of("mode", "bmc", "depth", 6));
+        assertEquals("FAIL", p.get("status"), p.toString());
+        assertEquals("lock_step", p.get("check"), p.toString());
+        assertTrue(last(s, "slow_out") != last(s, "fast_out"), "replayed with the prover's edges: " + p);
+    }
+
     @Test
     void aCrossingNeedsASynchroniser() {
         var r = new Session(new Elaborator(List.of(), 1000)).load(twoCounters(true, false).doc);

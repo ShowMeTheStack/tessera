@@ -18,7 +18,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * The same treatment for every core in {@link Cores}: riscv-tests, riscv-arch-test, the Zicsr
- * programs, 100 random programs (half RV32IM) and a Verilator lint, each instruction checked
+ * programs, 100 random programs (half RV32IM), 50 branch-dense and 50 memory-dense random programs and a Verilator lint, each instruction checked
  * against the ISS as it retires. Prints CPI per core and suite.
  */
 class CoreMatrixTest {
@@ -51,6 +51,18 @@ class CoreMatrixTest {
     static List<Arguments> randomPrograms() {
         var out = new ArrayList<Arguments>();
         for (var c : ids()) for (long seed = 1000; seed < 1100; seed++) out.add(Arguments.of(c, seed));
+        return out;
+    }
+
+    static List<Arguments> branchPrograms() {
+        var out = new ArrayList<Arguments>();
+        for (var c : ids()) for (long seed = 2000; seed < 2050; seed++) out.add(Arguments.of(c, seed));
+        return out;
+    }
+
+    static List<Arguments> memoryPrograms() {
+        var out = new ArrayList<Arguments>();
+        for (var c : ids()) for (long seed = 3000; seed < 3050; seed++) out.add(Arguments.of(c, seed));
         return out;
     }
 
@@ -95,12 +107,49 @@ class CoreMatrixTest {
         }
     }
 
+    /** Programs dense in branches, loops and JALRs, with M operations on wrong paths (RandomProgram.branches). */
+    @ParameterizedTest(name = "{0} branches {1}")
+    @MethodSource("branchPrograms")
+    void branchPrograms(String id, long seed) {
+        var e = core(id, RiscvTests.MEM_WORDS);
+        try (var sim = CoreRunner.sim(e)) {
+            var r = CoreRunner.run(e, sim, RandomProgram.branches(seed, 400, seed % 2 == 1), 400_000);
+            assertTrue(r.retired() > 100);
+            count(id, "branches", r);
+        }
+    }
+
+    /** Programs dense in overlapping loads and stores, with slow addresses and data (RandomProgram.memory). */
+    @ParameterizedTest(name = "{0} memory {1}")
+    @MethodSource("memoryPrograms")
+    void memoryPrograms(String id, long seed) {
+        var e = core(id, RiscvTests.MEM_WORDS);
+        try (var sim = CoreRunner.sim(e)) {
+            var r = CoreRunner.run(e, sim, RandomProgram.memory(seed, 400, seed % 2 == 1), 400_000);
+            assertTrue(r.retired() > 100);
+            count(id, "memory", r);
+        }
+    }
+
+    /** Directed programs: checkpoint reuse after a recovery (RandomProgram.checkpointReuse). */
+    @ParameterizedTest(name = "{0} directed")
+    @MethodSource("ids")
+    void directedPrograms(String id) {
+        var e = core(id, RiscvTests.MEM_WORDS);
+        try (var sim = CoreRunner.sim(e)) {
+            var r = CoreRunner.run(e, sim, RandomProgram.checkpointReuse(), 20_000);
+            assertTrue(r.retired() > 10);
+            count(id, "directed", r);
+        }
+    }
+
     @ParameterizedTest(name = "{0} zicsr")
     @MethodSource("ids")
     void zicsrPrograms(String id) {
         ZicsrTest.checkCsr(ZicsrTest.cosim(() -> Cores.get(id).build(ZicsrTest.MEM, null), "csr", Long.MAX_VALUE));
         ZicsrTest.checkTraps(ZicsrTest.cosim(() -> Cores.get(id).build(ZicsrTest.MEM, null), "traps", Long.MAX_VALUE));
         ZicsrTest.checkIrq(() -> Cores.get(id).build(ZicsrTest.MEM, null));
+        ZicsrTest.checkSideEffects(() -> Cores.get(id).build(ZicsrTest.MEM, null));
     }
 
     @ParameterizedTest(name = "{0} lint")

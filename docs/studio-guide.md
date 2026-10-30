@@ -25,7 +25,7 @@ Then open the address it prints (`http://127.0.0.1:8800/` by default). The serve
 |---|---|
 | `--port N` | The port (default 8800). |
 | `--src DIR[:DIR…]` | Your project's Java sources. Their `Module` classes appear in the palette (*Modules → This project*). Drawings may use them, and drawings are compiled with them. |
-| `--designs CLASS` | A registry of designs to open from *Designs*: a class with a static method `studioDesigns()` returning a `Map<String, Supplier<? extends Module>>`. The eight RISC-V cores of `tessera-riscv` are always listed. |
+| `--designs CLASS` | A registry of designs to open from *Designs*: a class with a static method `studioDesigns()` returning a `Map<String, Supplier<? extends Module>>`. The RISC-V cores of `tessera-riscv` and their variants are always listed. |
 | `--hz N` | The clock frequency the simulator assumes for `Clock`-based parts such as Blink (default 1000). |
 | `--dev DIR` | Serve the front end from `DIR` file by file, so edits to the web sources show on reload. |
 
@@ -299,7 +299,7 @@ In the picture: **1** a test that passed, with its cycles; **2** one that failed
 
 ### 5.8 The pipeline diagram
 The dock's **Pipeline** tab draws a running pipeline as Konata does: one row per instruction, one column per cycle, and in each cell the stage the instruction was in.
-- **Which designs:** any design built with Tessera's `Pipeline` (C2–C6, and pipelines of your own). It reads signals every pipeline already has: a hold wire and a valid bit per stage, and the program counter's copy in each stage. Nothing has to be added to the design. The out-of-order core C7 is written without `Pipeline`, so the tab says it has nothing to draw.
+- **Which designs:** any design built with Tessera's `Pipeline` (C2–C6, and pipelines of your own). It reads signals every pipeline already has: a hold wire and a valid bit per stage, and the program counter's copy in each stage. Nothing has to be added to the design. The out-of-order cores (C7, C11 and its variants, and the generated C7g cores) are drawn as their reorder buffer instead: one row per instruction from dispatch to commit, with its state in each cycle (in a reservation station, issued, in the load or store queue, done, committed or flushed) and rows below for the ROB, reservation stations, queues and checkpoints in use.
 - **Colours:** a stage in which the instruction **waits** (a stall: load-use, the divider) is amber. An instruction **flushed** by a redirect (a taken branch, a jump, a trap) or a halt is struck through in red, in the cycle it was cancelled. Green marks the cycle an instruction **left the last stage**.
 - **Rows:** each row shows the instruction's pc and its assembly, read from the core's instruction memory (`imem`).
 - **Time travel:** it shows the cycles up to the one you are looking at, as many as fit. Click a cycle number to go there; the whole tool follows (§7). *Earlier* and *Later* move the window; *Follow* goes back to following the current cycle.
@@ -605,7 +605,7 @@ Studio keeps its settings in the browser:
 Nothing is sent anywhere but the Studio server on 127.0.0.1.
 
 ### 10.5 The HTTP API
-- **The surface:** everything the page does goes through a small JSON API on the server, so scripts and assistants can drive Studio too. `POST /api/<name>` takes a JSON body and returns JSON. Errors are `{"error": "sentence"}`, with status 400.
+- **The surface:** everything the page does goes through a small JSON API on the server, so scripts and other tools can drive Studio too. `POST /api/<name>` takes a JSON body and returns JSON. Errors are `{"error": "sentence"}`, with status 400.
 - **Values:** values in frames and waves are hexadecimal strings.
 
 | Endpoint | Body | Answer |

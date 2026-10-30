@@ -193,39 +193,10 @@ public class OooCore extends RvCore {
 
         // multiply/divide unit
         UInt mInst = pickOneHot(mdPick, sInst), mA = pickOneHot(mdPick, s1Val), mB = pickOneHot(mdPick, s2Val);
-        var mHalf = Rv32i.mulDivStart(d, Rv32i.decode(d, mInst, zicsr), mA, mB, 0);
-        UInt mdTag = reg("md_tag", UInt.w(TAG), 0);
-        UInt mdCount = reg("md_count", UInt.w(6), 0);
-        Bool mdIsDiv = reg("md_div", Bool.TYPE, 0);
-        UInt[] mdRegs = new UInt[11];
-        String[] mdNames = {"a", "b", "funct3", "p00", "p01", "p10", "p11", "rem", "quo", "dividend", "divisor"};
-        UInt[] mdNow = {mHalf.a(), mHalf.b(), mHalf.funct3(), mHalf.p00(), mHalf.p01(), mHalf.p10(), mHalf.p11(),
-                mHalf.rem(), mHalf.quo(), mHalf.dividend(), mHalf.divisor()};
-        for (int k = 0; k < mdRegs.length; k++) mdRegs[k] = reg("md_" + mdNames[k], UInt.w(mdNow[k].width()), 0);
-        Bool mdNegQ = reg("md_neg_q", Bool.TYPE, 0), mdNegR = reg("md_neg_r", Bool.TYPE, 0), mdByZero = reg("md_by_zero", Bool.TYPE, 0);
-        when(mdIssue, () -> {
-            mdBusy.set(true);
-            mdTag.set(pickOneHot(mdPick, sTag));
-            mdCount.set(0);
-            mdIsDiv.set(mInst.bit(14));
-            for (int k = 0; k < mdRegs.length; k++) mdRegs[k].set(mdNow[k]);
-            mdNegQ.set(mHalf.negQ());
-            mdNegR.set(mHalf.negR());
-            mdByZero.set(mHalf.byZero());
-        });
-        when(mdBusy.and(mdIsDiv).and(mdCount.ne(32)), () -> {
-            Object[] st = Rv32i.divSteps(d, mdRegs[7], mdRegs[8], mdRegs[9], mdRegs[10], 2);
-            mdRegs[7].set((UInt) st[0]);
-            mdRegs[8].set((UInt) st[1]);
-            mdRegs[9].set((UInt) st[2]);
-            mdCount.set(mdCount.addWrap(2));
-        });
-        // with riscv-formal's ALTOPS the result is a simple function of the operands: no iterations
-        Bool mdBus = (d.altops() ? mdBusy : mdBusy.and(mdIsDiv.not().or(mdCount.eq(32)))).named("md_bus");
-        UInt mdVal = Rv32i.mulDivFinish(d, new Rv32i.MulDivHalf<>(mdRegs[0], mdRegs[1], mdRegs[2], mdRegs[3], mdRegs[4],
-                mdRegs[5], mdRegs[6], mdRegs[7], mdRegs[8], mdRegs[9], mdRegs[10], mdNegQ, mdNegR, mdByZero), 0)
-                .named("md_value");
-        when(mdBus, () -> mdBusy.set(false));
+        var md = mulDivUnit(mdBusy, mdIssue, pickOneHot(mdPick, sTag), mInst, mA, mB, zicsr);
+        UInt mdTag = md.tag(), mdVal = md.value();
+        UInt[] mdRegs = {md.a(), md.b()};
+        Bool mdBus = md.bus();
 
         // the three buses: ALU, multiply/divide, commit (for loads, whose value appears only there)
         UInt[] busTag = {aTag, mdTag, head};
@@ -364,6 +335,7 @@ public class OooCore extends RvCore {
     }
 
     private record Operand(Bool ready, UInt value, UInt tag) {}
+
 
     /** A CSR instruction (with Zicsr): it reads its CSR, and writes rd, when it commits. */
     private static Bool csr(Rv32i.Decoded<UInt, Bool> dec) {

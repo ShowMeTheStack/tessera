@@ -53,7 +53,11 @@ final class Modules {
             new Choice("Arbiter", "new Arbiter<>(UInt.w(8), 2, Arbiter.Policy.ROUND_ROBIN)", List.of("org.eninehq.tessera.stdlib.Arbiter"),
                     "Merges n streams into one, by priority or round robin; chosen says which input went through."),
             new Choice("Register file", "new RegFile(32, 32, 2, 1, true, false)", List.of("org.eninehq.tessera.stdlib.RegFile"),
-                    "count × width registers with read and write ports (here 32 × 32, two reads, one write, register 0 reads 0)."));
+                    "count × width registers with read and write ports (here 32 × 32, two reads, one write, register 0 reads 0)."),
+            new Choice("True dual-port RAM", "new TrueDualPortRam(256, 32)", List.of("org.eninehq.tessera.stdlib.TrueDualPortRam"),
+                    "depth × width words with two ports, a and b, each reading (one cycle after the address) and writing its own address; one block RAM on an FPGA."),
+            new Choice("Register file (live-value table)", "new LvtRegFile(32, 32, 4, 2, true)", List.of("org.eninehq.tessera.stdlib.LvtRegFile"),
+                    "A register file with several write ports from one-write LUT RAMs and a table of last writers (here 32 × 32, four reads, two writes, register 0 reads 0)."));
 
     /** What a code part's class may use without importing it (the generated file imports the same). */
     static final List<String> CODE_IMPORTS = List.of("org.eninehq.tessera.core.*", "org.eninehq.tessera.core.Module", "org.eninehq.tessera.stdlib.*",

@@ -132,6 +132,23 @@ public final class Netlist {
         return constantSlots.contains(slot);
     }
 
+    private java.util.BitSet named;
+
+    /**
+     * True when word {@code slot} starts the value of a signal (a port, wire or register, which
+     * {@code peek}, tracing and snapshots by path can observe), as opposed to an unnamed
+     * intermediate expression.
+     */
+    public synchronized boolean isSignalSlot(int slot) {
+        var n = named;
+        if (n == null) {
+            n = new java.util.BitSet(slotCount());
+            for (int s : signalSlot.values()) if (s >= 0) n.set(s);
+            named = n;
+        }
+        return n.get(slot);
+    }
+
     /** True for a top-level clock input. */
     public boolean isClock(Signal s) {
         for (var c : clocks) if (c == s) return true;

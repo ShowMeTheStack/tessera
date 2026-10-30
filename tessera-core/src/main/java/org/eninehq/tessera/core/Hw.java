@@ -177,6 +177,16 @@ public final class Hw {
 
     // ---------------------------------------------------------------- state from library code
 
+    /** A memory in the current module (what {@code Module.mem} makes), for library code that builds inside a module. */
+    public static <T extends Data> Mem<T> memory(String name, HwType<T> type, int depth) {
+        var b = Elab.cur();
+        if (depth < 1) throw TesseraException.here("memory depth must be >= 1");
+        var md = new org.eninehq.tessera.ir.MemDef(name, type.width(), type.signed(), depth, b.def, SourceLoc.here());
+        b.def.mems().add(md);
+        b.effects++;
+        return new Mem<>(md, type);
+    }
+
     /**
      * A register in the current module and clock domain, for library functions that are not
      * module constructors. {@code init} is the reset value, or null for no reset.

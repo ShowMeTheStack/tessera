@@ -55,6 +55,7 @@ public final class Session implements AutoCloseable {
     private CriticalPath.Table timingTable;
     private Map<String, String> lastPaths = Map.of();
     private List<PipeView.Pipe> pipes = List.of();   // the running design's pipelines, for the diagram
+    private List<OooView.Rob> robs = List.of();      // its reorder buffer, if it is an out-of-order core
     private long unwatchedSince;
     private String untilText;
     private long viewCycle = -1;            // the cycle shown when looking into the past, or -1 for the head
@@ -253,6 +254,8 @@ public final class Session implements AutoCloseable {
         for (var p : e.circuit().top().ports()) record.add(p.name());
         pipes = dualProbes(PipeView.relabel(PipeView.find(e.circuit().top()), scheduleStages(e.top())), e.top());
         for (var p : pipes) record.addAll(p.paths());   // the diagram reads them from the record
+        robs = OooView.find(e.circuit().top());
+        for (var r : robs) record.addAll(r.paths());
         record.addAll(waves.paths());
         waves.retarget(signals(), record, cycle());
         sampleAll();
@@ -569,13 +572,17 @@ public final class Session implements AutoCloseable {
         String mode = String.valueOf(req.getOrDefault("mode", "bmc"));
         int depth = ((Number) req.getOrDefault("depth", 20)).intValue();
         var out = new LinkedHashMap<String, Object>();
+        var opt = proveOptions(req);
+        if (opt != null) out.put("options", Map.of("freeAsyncResets", opt.freeAsyncResets(), "atLeastOneTick", opt.atLeastOneTick(),
+                "maxTickGap", opt.maxTickGap(), "arbitraryMemory", opt.arbitraryMemory(), "resetCycles", opt.resetCycles()));
+        var o = opt == null ? org.eninehq.tessera.formal.Formal.Options.defaults() : opt;
         long t0 = System.nanoTime();
         try {
             if (mode.equals("cover")) {
-                out.put("covers", org.eninehq.tessera.formal.Formal.cover(e, depth));
+                out.put("covers", org.eninehq.tessera.formal.Formal.cover(e.circuit(), depth, o));
                 out.put("status", "COVER");
             } else {
-                var r = mode.equals("prove") ? org.eninehq.tessera.formal.Formal.prove(e, depth) : org.eninehq.tessera.formal.Formal.bmc(e, depth);
+                var r = mode.equals("prove") ? org.eninehq.tessera.formal.Formal.prove(e.circuit(), depth, o) : org.eninehq.tessera.formal.Formal.bmc(e.circuit(), depth, o);
                 out.put("status", r.status().toString());
                 out.put("text", r.toString());
                 out.put("depth", r.depth());
@@ -594,6 +601,28 @@ public final class Session implements AutoCloseable {
         return out;
     }
 
+    /**
+     * The prover's options from a request: {@code freeAsyncResets}, {@code atLeastOneTick} (booleans),
+     * {@code maxTickGap}, {@code resetCycles} (numbers) and {@code arbitraryMemory} (boolean) over
+     * {@code Formal.Options.defaults()}; null when the request names none (the defaults, as before).
+     */
+    static org.eninehq.tessera.formal.Formal.Options proveOptions(Map<String, Object> req) {
+        var o = org.eninehq.tessera.formal.Formal.Options.defaults();
+        boolean any = false;
+        if (req.get("freeAsyncResets") instanceof Boolean b) { o = o.withFreeAsyncResets(b); any = true; }
+        if (req.get("atLeastOneTick") instanceof Boolean b) { o = o.withAtLeastOneTick(b); any = true; }
+        if (req.get("maxTickGap") instanceof Number n) {
+            if (n.intValue() < 0) throw new IllegalArgumentException("maxTickGap is 0 (no bound) or a number of steps.");
+            o = o.withMaxTickGap(n.intValue()); any = true;
+        }
+        if (req.get("resetCycles") instanceof Number n) {
+            if (n.intValue() < 0) throw new IllegalArgumentException("resetCycles is 0 or more.");
+            o = o.withResetCycles(n.intValue()); any = true;
+        }
+        if (req.get("arbitraryMemory") instanceof Boolean b) { o = o.withArbitraryMemory(b); any = true; }
+        return any ? o : null;
+    }
+
     private long traceFrom = -1;
 
     /** Replay a counterexample as the current run, so that the waves and the drawing show it, cycle by cycle. */
@@ -604,6 +633,15 @@ public final class Session implements AutoCloseable {
         sim.loadRegisterState(r.initialState());
         base = start;
         tt = new TimeTravel(sim, 16);
+        if (r.ticks() != null) {
+            // several clocks: replay (and later re-replay) the clock edges the prover chose for each cycle
+            long first = sim.cycle();
+            tt.stepper((s, c) -> {
+                long i = c - first;
+                if (i >= 0 && i < r.ticks().size()) s.stepClocks(r.ticks().get((int) i));
+                else s.step();
+            });
+        }
         viewCycle = -1;
         running = false;
         traceFrom = start;
@@ -680,9 +718,27 @@ public final class Session implements AutoCloseable {
         if (sim == null) throw new IllegalArgumentException("Nothing is running yet.");
         String path = String.valueOf(req.get("path"));
         Integer i = sim.netlist().memsByPath().get(path);
-        if (i == null) throw new IllegalArgumentException("There is no memory " + path + " in this design.");
+        Integer lvt = i == null ? lvtFiles().get(path) : null;
+        if (i == null && lvt == null) throw new IllegalArgumentException("There is no memory " + path + " in this design.");
         if (viewCycle >= 0 && viewCycle < reachable())
             throw new IllegalArgumentException("Memory contents are kept only from cycle " + reachable() + " on; go to a later cycle to see them.");
+        if (lvt != null) {   // a live-value-table register file, read through its table
+            var b0 = sim.netlist().mems().get(sim.netlist().memsByPath().get(path + "_b0_r0"));
+            int from = Math.max(0, ((Number) req.getOrDefault("from", 0)).intValue());
+            int count = Math.min(1024, Math.max(0, ((Number) req.getOrDefault("count", 256)).intValue()));
+            int to = Math.min(b0.depth(), from + count);
+            var words = new ArrayList<String>();
+            for (long w : lvtWords(path, from, to)) words.add(Long.toHexString(w));
+            var out = new LinkedHashMap<String, Object>();
+            out.put("path", path);
+            out.put("width", b0.width());
+            out.put("depth", b0.depth());
+            out.put("from", from);
+            out.put("words", words);
+            out.put("cycle", cycle());
+            out.put("lvt", lvt);
+            return out;
+        }
         var m = sim.netlist().mems().get(i);
         int from = Math.max(0, ((Number) req.getOrDefault("from", 0)).intValue());
         int count = Math.min(1024, Math.max(0, ((Number) req.getOrDefault("count", 256)).intValue()));
@@ -717,17 +773,21 @@ public final class Session implements AutoCloseable {
         long from = req.get("from") instanceof Number n ? n.longValue() : to - 39;
         from = Math.max(Math.max(0, from), to - 400);
         if (waves.droppedBefore() > from) from = waves.droppedBefore();
-        long[] imem = !pipes.isEmpty() && sim.netlist().memsByPath().containsKey("imem") ? sim.memory("imem").clone() : null;
+        long[] imem = (!pipes.isEmpty() || !robs.isEmpty()) && sim.netlist().memsByPath().containsKey("imem") ? sim.memory("imem").clone() : null;
+        java.util.function.LongFunction<String> text = pc -> imem == null || imem.length == 0 ? null : Rv32Disasm.of(imem[(int) ((pc >>> 2) % imem.length)]);
         var list = new ArrayList<Object>();
         for (var p : pipes) {
             var items = PipeView.follow(p, from, to, waves::at);
-            list.add(PipeView.json(p, items, pc -> imem == null || imem.length == 0 ? null : Rv32Disasm.of(imem[(int) ((pc >>> 2) % imem.length)])));
+            list.add(PipeView.json(p, items, text));
         }
+        var ooo = new ArrayList<Object>();
+        for (var r : robs) ooo.add(OooView.json(r, OooView.follow(r, from, to, waves::at), text));
         var out = new LinkedHashMap<String, Object>();
         out.put("cycle", now);
         out.put("from", from);
         out.put("to", to);
         out.put("pipes", list);
+        out.put("ooo", ooo);
         out.put("schedule", schedule());
         return out;
     }
@@ -759,9 +819,12 @@ public final class Session implements AutoCloseable {
         for (Class<?> c = top.getClass(); c != null && c != Object.class; c = c.getSuperclass())
             for (var f : c.getDeclaredFields())
                 if (java.lang.reflect.Modifier.isPublic(f.getModifiers()) && List.of("org.eninehq.tessera.pipeline.InOrderPipeline",
-                        "org.eninehq.tessera.pipeline.DualIssuePipeline").contains(f.getType().getName())) out.add(f);
+                        "org.eninehq.tessera.pipeline.DualIssuePipeline", OOO_PIPELINE).contains(f.getType().getName())) out.add(f);
         return out;
     }
+
+    /** The out-of-order generator: its report is the schedule's account; it has no stages to draw by name. */
+    private static final String OOO_PIPELINE = "org.eninehq.tessera.pipeline.OutOfOrderPipeline";
 
     /**
      * A dual-issue core's pipeline as two lanes: lane 1 travels in registers its signals do not name, so the generator's
@@ -794,6 +857,7 @@ public final class Session implements AutoCloseable {
     /** The stage names of the design's Level-2 pipeline, or null (the signals name the first stage "s0"). */
     private static List<String> scheduleStages(Object top) {
         for (var f : pipelineFields(top)) {
+            if (f.getType().getName().equals(OOO_PIPELINE)) continue;
             try {
                 Object p = f.get(top);
                 if (p != null) {
@@ -813,7 +877,44 @@ public final class Session implements AutoCloseable {
         var l = new ArrayList<Object>();
         if (sim == null) return l;
         for (var m : sim.netlist().mems()) l.add(Map.of("path", m.path(), "width", m.width(), "depth", m.depth()));
+        for (var e : lvtFiles().entrySet()) {
+            var b0 = sim.netlist().mems().get(sim.netlist().memsByPath().get(e.getKey() + "_b0_r0"));
+            l.add(Map.of("path", e.getKey(), "width", b0.width(), "depth", b0.depth(), "lvt", e.getValue()));
+        }
         return l;
+    }
+
+    /**
+     * The register files built as a live-value table (stdlib LiveValueTable) that have no memory of their own
+     * name: {@code <name>_lvt} (the table of last writers) and banks {@code <name>_b<w>_r<r>}. By name, the number of
+     * write banks. {@link #mem} reads such a name as the register file: word a is bank {@code lvt[a]}'s copy at a.
+     */
+    private Map<String, Integer> lvtFiles() {
+        var by = sim.netlist().memsByPath();
+        var out = new LinkedHashMap<String, Integer>();
+        for (String p : by.keySet()) {
+            if (!p.endsWith("_lvt")) continue;
+            String base = p.substring(0, p.length() - 4);
+            if (by.containsKey(base) || !by.containsKey(base + "_b0_r0")) continue;
+            int w = 0;
+            while (by.containsKey(base + "_b" + w + "_r0")) w++;
+            out.put(base, w);
+        }
+        return out;
+    }
+
+    /** A live-value-table register file's words {@code from..to} (single-word entries: at most 64 bits wide). */
+    private long[] lvtWords(String base, int from, int to) {
+        var by = sim.netlist().memsByPath();
+        long[] table = sim.memory(base + "_lvt");
+        var banks = new ArrayList<long[]>();
+        for (int w = 0; by.containsKey(base + "_b" + w + "_r0"); w++) banks.add(sim.memory(base + "_b" + w + "_r0"));
+        long[] out = new long[Math.max(0, to - from)];
+        for (int a = from; a < to; a++) {
+            int w = (int) table[a];
+            out[a - from] = w < banks.size() ? banks.get(w)[a] : 0;
+        }
+        return out;
     }
 
     /** The running design as SystemVerilog. */

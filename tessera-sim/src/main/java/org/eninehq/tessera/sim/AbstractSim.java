@@ -100,6 +100,13 @@ abstract class AbstractSim implements Simulator {
     private void commit(long mask) {
         checkProperties(mask);
         boolean all = mask == -1L;
+        if (all && fastCommit != null) {
+            // generated register update (CompiledSim): same values, same order of effects as below
+            captureWrites(true, mask);
+            fastCommit.commit(v, next);
+            applyWrites();
+            return;
+        }
         for (int i = 0; i < regs.length; i++) {
             var r = regs[i];
             if (!all && (mask >>> r.domain() & 1) == 0) next[i] = v[r.slot()];
@@ -111,6 +118,26 @@ abstract class AbstractSim implements Simulator {
             else if (resetActive(r)) System.arraycopy(r.resetWords(), 0, nextWide[i], 0, r.words());
             else System.arraycopy(v, r.next(), nextWide[i], 0, r.words());
         }
+        captureWrites(all, mask);
+        for (int i = 0; i < regs.length; i++) v[regs[i].slot()] = next[i];
+        for (int i = 0; i < wideRegs.length; i++) System.arraycopy(nextWide[i], 0, v, wideRegs[i].slot(), wideRegs[i].words());
+        applyWrites();
+    }
+
+    /**
+     * Generated code that computes and stores the next value of every register of at most 64 bits
+     * (all clocks, reset applied), reading only values settled before the edge; {@code tmp} has one
+     * word per such register. Set only when the design has no wider register.
+     */
+    protected CompiledCommit fastCommit;
+
+    /** Narrow registers, in the order {@link #fastCommit} indexes {@code tmp}. */
+    protected final Netlist.Reg[] narrowRegs() { return regs; }
+
+    protected final boolean hasWideRegs() { return wideRegs.length > 0; }
+
+    /** Latch the write ports' enable, address and data from the settled values (before any register changes). */
+    private void captureWrites(boolean all, long mask) {
         for (int i = 0; i < writes.length; i++) {
             var w = writes[i];
             wEn[i] = (all || (mask >>> w.domain() & 1) != 0) && v[w.en()] != 0;
@@ -118,8 +145,9 @@ abstract class AbstractSim implements Simulator {
             if (wDataWide[i] != null) System.arraycopy(v, w.data(), wDataWide[i], 0, writeWords[i]);
             else wData[i] = v[w.data()];
         }
-        for (int i = 0; i < regs.length; i++) v[regs[i].slot()] = next[i];
-        for (int i = 0; i < wideRegs.length; i++) System.arraycopy(nextWide[i], 0, v, wideRegs[i].slot(), wideRegs[i].words());
+    }
+
+    private void applyWrites() {
         for (int i = 0; i < writes.length; i++) {
             if (!wEn[i]) continue;
             long[] mem = mems[writes[i].mem()];
@@ -127,6 +155,8 @@ abstract class AbstractSim implements Simulator {
             if (Long.compareUnsigned(wAddr[i], mem.length / nw) >= 0) continue;
             if (nw == 1) mem[(int) wAddr[i]] = wData[i];
             else System.arraycopy(wDataWide[i], 0, mem, (int) wAddr[i] * nw, nw);
+            if (writeListeners != null && writeListeners[i] != null)
+                for (var l : writeListeners[i]) l.written(cycle, wAddr[i], nw == 1 ? wData[i] : wDataWide[i][0]);
         }
     }
 
@@ -197,6 +227,21 @@ abstract class AbstractSim implements Simulator {
 
     @Override public void addListener(Simulator.Listener l) { listeners.add(l); }
 
+    /** Per write port: the listeners of its memory (null when nobody observes it). */
+    private Simulator.MemoryWriteListener[][] writeListeners;
+
+    @Override public void addMemoryWriteListener(Mem<?> mem, Simulator.MemoryWriteListener l) {
+        int m = net.memIndexOf(mem.def());
+        if (writeListeners == null) writeListeners = new Simulator.MemoryWriteListener[writes.length][];
+        for (int i = 0; i < writes.length; i++) {
+            if (writes[i].mem() != m) continue;
+            var old = writeListeners[i] == null ? new Simulator.MemoryWriteListener[0] : writeListeners[i];
+            var n = java.util.Arrays.copyOf(old, old.length + 1);
+            n[old.length] = l;
+            writeListeners[i] = n;
+        }
+    }
+
     // ------------------------------------------------------------ poke and peek
 
     private int inputSlot(Signal s, String what) {
@@ -237,7 +282,8 @@ abstract class AbstractSim implements Simulator {
         pokeSlotBig(inputSlot(net.signalsByPath().get(path), path), value);
     }
 
-    private long peekSlot(int slot, String what) {
+    /** {@code what} is only turned into a string for the error message (not on every peek). */
+    private long peekSlot(int slot, Object what) {
         if (slot < 0) throw new IllegalArgumentException("signal " + what + " is not part of the simulated design");
         settle();
         return v[slot];
@@ -246,7 +292,7 @@ abstract class AbstractSim implements Simulator {
     @Override public long peek(Data d) {
         if (d.signal() == null) throw new IllegalArgumentException("can only peek named signals (ports, wires, registers); "
                 + "use .named(...) to name an expression");
-        return peekSlot(net.slotOf(d.signal()), String.valueOf(d));
+        return peekSlot(net.slotOf(d.signal()), d);
     }
 
     @Override public long peek(String path) {

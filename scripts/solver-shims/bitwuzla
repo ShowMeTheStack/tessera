@@ -1,0 +1,24 @@
+#!/bin/sh
+# yosys-smtbmc (Yosys 0.64, smtio.py) starts "bitwuzla --smt2 -i", the older command line; bitwuzla 0.9 takes
+# "--lang smt2" and is incremental by default. This translates those two flags and passes everything else on.
+# Put this directory first on PATH; the real solver is $BITWUZLA, or the next bitwuzla on PATH.
+here=$(cd "$(dirname "$0")" && pwd)
+real=${BITWUZLA:-}
+if [ -z "$real" ]; then
+  IFS=:
+  for d in $PATH; do
+    [ "$(cd "$d" 2>/dev/null && pwd)" = "$here" ] && continue
+    if [ -x "$d/bitwuzla" ]; then real="$d/bitwuzla"; break; fi
+  done
+  unset IFS
+fi
+[ -n "$real" ] || { echo "bitwuzla shim: no bitwuzla found (set BITWUZLA)" >&2; exit 127; }
+args=""
+for a in "$@"; do
+  case "$a" in
+    --smt2) args="$args --lang smt2" ;;
+    -i) ;;
+    *) args="$args $a" ;;
+  esac
+done
+exec "$real" $args

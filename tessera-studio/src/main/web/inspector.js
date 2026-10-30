@@ -188,6 +188,17 @@
         this.mem.from = Math.floor(a / perRow) * perRow; this.mem.last = null; this.memFetch(true);
       });
       this.memFetch(true);
+      // the table of a live-value-table register file (<name>_lvt): its registers, read through the table, on request
+      if (/_lvt$/.test(path)) {
+        const base = path.replace(/_lvt$/, '');
+        box.append(S.UI.button('Show the registers (read through the table)', { title: 'The values of ' + base + ': each word from the bank the table says wrote it last', onclick: async () => {
+          let l = [];
+          try { l = await S.Api.call('mems'); } catch (e) { note.textContent = e.message; return; }
+          const f = l.find((x) => x.path === base && x.lvt);
+          if (!f) { note.textContent = 'There is no register file ' + base + ' behind this table.'; return; }
+          box.replaceWith(this.memView({ id: p.id, params: { name: base.slice(prefix.length), width: f.width, depth: f.depth } }));
+        } }));
+      }
       return box;
     }
 

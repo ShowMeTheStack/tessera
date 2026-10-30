@@ -45,24 +45,60 @@ public final class Formal {
         UNKNOWN
     }
 
-    /** Options: solver binary, reset cycles at the start, whether memories start arbitrary. */
-    public record Options(String solver, int resetCycles, boolean arbitraryMemory) {
+    /**
+     * Options: solver binary, reset cycles at the start, whether memories start arbitrary, and for
+     * designs with several clocks or asynchronous resets:
+     * <ul>
+     * <li>{@code freeAsyncResets}: after the reset cycles, a reset input that drives an asynchronous
+     *     reset is a free input that may change at any step (default); otherwise it is held inactive,
+     *     like synchronous resets;
+     * <li>{@code atLeastOneTick}: assume some clock has an edge at every step (default off);
+     * <li>{@code maxTickGap}: if positive, assume every clock has an edge in every {@code maxTickGap}
+     *     consecutive steps, which bounds the ratio of the clock rates (default 0, off).
+     * </ul>
+     * By default the clocks are fully independent: in every step any subset of them has an edge.
+     * During the reset cycles every clock has an edge.
+     */
+    public record Options(String solver, int resetCycles, boolean arbitraryMemory, boolean freeAsyncResets,
+                          boolean atLeastOneTick, int maxTickGap) {
+        public Options(String solver, int resetCycles, boolean arbitraryMemory) {
+            this(solver, resetCycles, arbitraryMemory, true, false, 0);
+        }
+
         public static Options defaults() {
             return new Options(findSolver(), 1, false);
         }
 
-        public Options withSolver(String s) { return new Options(s, resetCycles, arbitraryMemory); }
-        public Options withArbitraryMemory(boolean b) { return new Options(solver, resetCycles, b); }
+        public Options withSolver(String s) { return new Options(s, resetCycles, arbitraryMemory, freeAsyncResets, atLeastOneTick, maxTickGap); }
+        public Options withArbitraryMemory(boolean b) { return new Options(solver, resetCycles, b, freeAsyncResets, atLeastOneTick, maxTickGap); }
+        public Options withResetCycles(int n) { return new Options(solver, n, arbitraryMemory, freeAsyncResets, atLeastOneTick, maxTickGap); }
+        public Options withFreeAsyncResets(boolean b) { return new Options(solver, resetCycles, arbitraryMemory, b, atLeastOneTick, maxTickGap); }
+        public Options withAtLeastOneTick(boolean b) { return new Options(solver, resetCycles, arbitraryMemory, freeAsyncResets, b, maxTickGap); }
+        public Options withMaxTickGap(int n) { return new Options(solver, resetCycles, arbitraryMemory, freeAsyncResets, atLeastOneTick, n); }
     }
 
     /**
      * Outcome of a check. For FAIL, {@code counterexample} holds the top-level inputs for every
      * cycle up to and including {@code failCycle}; {@code check} names the property and its source line.
+     * For a design with several clocks, {@code ticks} holds, for every cycle, the clocks (paths, as
+     * {@code Simulator.clocks()} names them) that have an edge at the end of it; it is null otherwise
+     * (every cycle is an edge of the one clock).
      */
     public record Result(Status status, int depth, String check, String location, int failCycle,
                          List<Map<String, BigInteger>> counterexample, Map<String, BigInteger> initialState,
-                         Circuit circuit) {
+                         Circuit circuit, List<List<String>> ticks) {
+        public Result(Status status, int depth, String check, String location, int failCycle,
+                      List<Map<String, BigInteger>> counterexample, Map<String, BigInteger> initialState, Circuit circuit) {
+            this(status, depth, check, location, failCycle, counterexample, initialState, circuit, null);
+        }
+
         public boolean failed() { return status == Status.FAIL; }
+
+        /** Take the edges of cycle {@code i} of the counterexample in {@code sim}. */
+        public void step(Simulator sim, int i) {
+            if (ticks == null || i >= ticks.size()) sim.step();
+            else sim.stepClocks(ticks.get(i));
+        }
 
         /** Replay the counterexample in a simulator (and optionally record a waveform). */
         public AssertionError replay(Path trace) {
@@ -70,10 +106,10 @@ public final class Formal {
             try (Simulator sim = Sim.create(circuit, Sim.defaultBackend())) {
                 if (trace != null) sim.trace(trace);
                 sim.loadRegisterState(initialState);
-                for (var row : counterexample) {
-                    for (var e : row.entrySet()) sim.pokeBig(e.getKey(), e.getValue());
+                for (int i = 0; i < counterexample.size(); i++) {
+                    for (var e : counterexample.get(i).entrySet()) sim.pokeBig(e.getKey(), e.getValue());
                     try {
-                        sim.step();
+                        step(sim, i);
                     } catch (AssertionError err) {
                         return err;
                     }
@@ -124,19 +160,20 @@ public final class Formal {
                 var sb = new StringBuilder();
                 if (t > 0) u.transition(sb, t - 1);
                 u.declareStep(sb, t, false);
-                constrainResets(sb, net, u, t, opt.resetCycles());
+                constrainResets(sb, net, u, t, opt.resetCycles(), opt);
                 assumes(sb, net, u, t);
                 s.send(sb.toString());
                 // any assertion failing at step t?
                 for (int i = 0; i < net.checks().size(); i++) {
                     var ch = net.checks().get(i);
                     if (ch.kind() != Assertion.Kind.ASSERT) continue;
-                    s.send("(push 1)\n(assert (and (= " + u.term(t, ch.en(), 1) + " #b1) (= " + u.term(t, ch.cond(), 1) + " #b0)))\n");
+                    s.send("(push 1)\n(assert (and " + u.enabled(t, ch) + " (= " + u.term(t, ch.cond(), 1) + " #b0)))\n");
                     if (s.checkSat()) {
                         var cex = model(s, net, u, t);
+                        var ticks = ticks(s, net, u, t);
                         var init = initialRegs(s, net, u);
                         s.send("(pop 1)\n");
-                        return new Result(Status.FAIL, depth, ch.name(), ch.loc(), t, cex, init, c);
+                        return new Result(Status.FAIL, depth, ch.name(), ch.loc(), t, cex, init, c, ticks);
                     }
                     s.send("(pop 1)\n");
                 }
@@ -164,19 +201,19 @@ public final class Formal {
                 var sb = new StringBuilder();
                 if (t > 0) u.transition(sb, t - 1);
                 u.declareStep(sb, t, false);
-                constrainResets(sb, net, u, t, 0);
+                constrainResets(sb, net, u, t, 0, opt);
                 assumes(sb, net, u, t);
                 if (t < k)
                     for (var ch : net.checks())
                         if (ch.kind() == Assertion.Kind.ASSERT)
-                            sb.append("(assert (=> (= ").append(u.term(t, ch.en(), 1)).append(" #b1) (= ")
+                            sb.append("(assert (=> ").append(u.enabled(t, ch)).append(" (= ")
                                     .append(u.term(t, ch.cond(), 1)).append(" #b1)))\n");
                 s.send(sb.toString());
             }
             var bad = new StringBuilder("(assert (or false");
             for (var ch : net.checks())
                 if (ch.kind() == Assertion.Kind.ASSERT)
-                    bad.append(" (and (= ").append(u.term(k, ch.en(), 1)).append(" #b1) (= ").append(u.term(k, ch.cond(), 1)).append(" #b0))");
+                    bad.append(" (and ").append(u.enabled(k, ch)).append(" (= ").append(u.term(k, ch.cond(), 1)).append(" #b0))");
             s.send(bad.append("))\n").toString());
             boolean sat = s.checkSat();
             return new Result(sat ? Status.UNKNOWN : Status.PROVEN, k, null, null, -1, null, null, c);
@@ -185,8 +222,11 @@ public final class Formal {
 
     /** For each cover property, the first cycle it can be reached at (within {@code depth}), or -1. */
     public static Map<String, Integer> cover(Elaborated<?> e, int depth) {
-        var c = e.circuit();
-        var opt = Options.defaults();
+        return cover(e.circuit(), depth, Options.defaults());
+    }
+
+    /** For each cover property, the first cycle it can be reached at (within {@code depth}), or -1. */
+    public static Map<String, Integer> cover(Circuit c, int depth, Options opt) {
         var net = Netlist.build(c);
         var out = new LinkedHashMap<String, Integer>();
         for (var ch : net.checks()) if (ch.kind() == Assertion.Kind.COVER) out.put(ch.name(), -1);
@@ -198,12 +238,12 @@ public final class Formal {
                 var sb = new StringBuilder();
                 if (t > 0) u.transition(sb, t - 1);
                 u.declareStep(sb, t, false);
-                constrainResets(sb, net, u, t, opt.resetCycles());
+                constrainResets(sb, net, u, t, opt.resetCycles(), opt);
                 assumes(sb, net, u, t);
                 s.send(sb.toString());
                 for (var ch : net.checks()) {
                     if (ch.kind() != Assertion.Kind.COVER || out.get(ch.name()) >= 0) continue;
-                    s.send("(push 1)\n(assert (and (= " + u.term(t, ch.en(), 1) + " #b1) (= " + u.term(t, ch.cond(), 1) + " #b1)))\n");
+                    s.send("(push 1)\n(assert (and " + u.enabled(t, ch) + " (= " + u.term(t, ch.cond(), 1) + " #b1)))\n");
                     if (s.checkSat()) out.put(ch.name(), t);
                     s.send("(pop 1)\n");
                 }
@@ -214,22 +254,65 @@ public final class Formal {
 
     // ------------------------------------------------------------ helpers
 
-    private static void constrainResets(StringBuilder sb, Netlist net, SmtUnroller u, int t, int resetCycles) {
+    /**
+     * Reset inputs: active in the first {@code resetCycles} steps (with an edge of every clock),
+     * inactive afterwards, except that a reset driving an asynchronous reset is free afterwards when
+     * {@code opt.freeAsyncResets()}. Also the clock assumptions of {@code opt}.
+     */
+    private static void constrainResets(StringBuilder sb, Netlist net, SmtUnroller u, int t, int resetCycles, Options opt) {
         var resets = new LinkedHashMap<Integer, Long>();
-        for (var r : net.regs()) if (r.hasReset()) resets.put(r.resetSlot(), r.resetActive());
+        var async = new java.util.HashSet<Integer>();
+        for (var r : net.regs()) {
+            if (!r.hasReset()) continue;
+            resets.put(r.resetSlot(), r.resetActive());
+            if (r.asyncReset()) async.add(r.resetSlot());
+        }
         var inputs = net.inputSlots().values();
         for (var e : resets.entrySet()) {
             if (!inputs.contains(e.getKey())) continue; // derived resets follow from the logic
+            if (t >= resetCycles && opt.freeAsyncResets() && async.contains(e.getKey())) continue;
             long level = t < resetCycles ? e.getValue() : 1 - e.getValue();
             sb.append("(assert (= ").append(u.name(t, e.getKey())).append(" #b").append(level).append("))\n");
         }
+        if (!u.multiClock()) return;
+        if (t < resetCycles) {
+            for (var k : u.tickNames(t)) sb.append("(assert (= ").append(k).append(" #b1))\n");
+            return;
+        }
+        if (opt.atLeastOneTick()) {
+            sb.append("(assert (or false");   // "false": a single tick is still a well-formed or
+            for (var k : u.tickNames(t)) sb.append(" (= ").append(k).append(" #b1)");
+            sb.append("))\n");
+        }
+        int gap = opt.maxTickGap();
+        // every window of gap steps ending at t (windows reaching into the reset cycles hold anyway)
+        if (gap > 0 && t - gap + 1 >= 0)
+            for (int d = 0; d < u.domains; d++) {
+                sb.append("(assert (or false");   // "false": a single tick is still a well-formed or
+                for (int i = t - gap + 1; i <= t; i++) sb.append(" (= ").append(u.tickName(i, d)).append(" #b1)");
+                sb.append("))\n");
+            }
     }
 
     private static void assumes(StringBuilder sb, Netlist net, SmtUnroller u, int t) {
         for (var ch : net.checks())
             if (ch.kind() == Assertion.Kind.ASSUME)
-                sb.append("(assert (=> (= ").append(u.term(t, ch.en(), 1)).append(" #b1) (= ")
+                sb.append("(assert (=> ").append(u.enabled(t, ch)).append(" (= ")
                         .append(u.term(t, ch.cond(), 1)).append(" #b1)))\n");
+    }
+
+    /** The clocks with an edge in every step up to {@code last}, or null with one clock. */
+    private static List<List<String>> ticks(Solver s, Netlist net, SmtUnroller u, int last) {
+        if (!u.multiClock()) return null;
+        var rows = new ArrayList<List<String>>();
+        for (int t = 0; t <= last; t++) {
+            var vals = s.getValues(u.tickNames(t));
+            var row = new ArrayList<String>();
+            for (int d = 0; d < u.domains; d++)
+                if (BigInteger.ONE.equals(vals.get(u.tickName(t, d)))) row.add(net.clockPaths().get(d));
+            rows.add(List.copyOf(row));
+        }
+        return List.copyOf(rows);
     }
 
     private static List<Map<String, BigInteger>> model(Solver s, Netlist net, SmtUnroller u, int last) {
@@ -249,10 +332,10 @@ public final class Formal {
 
     private static Map<String, BigInteger> initialRegs(Solver s, Netlist net, SmtUnroller u) {
         var names = new ArrayList<String>();
-        for (var r : net.regs()) names.add(u.name(0, r.slot()));
+        for (var r : net.regs()) names.add(u.stateName(0, r.slot()));
         var vals = names.isEmpty() ? Map.<String, BigInteger>of() : s.getValues(names);
         var out = new LinkedHashMap<String, BigInteger>();
-        for (var r : net.regs()) if (r.path() != null) out.put(r.path(), vals.getOrDefault(u.name(0, r.slot()), BigInteger.ZERO));
+        for (var r : net.regs()) if (r.path() != null) out.put(r.path(), vals.getOrDefault(u.stateName(0, r.slot()), BigInteger.ZERO));
         return out;
     }
 
@@ -279,8 +362,14 @@ public final class Formal {
             out = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
         }
 
+        /** With system property {@code tessera.formal.tee} set to a file, everything sent to solvers is appended to it. */
+        private static final String TEE = System.getProperty("tessera.formal.tee");
+
         void send(String s) {
             try {
+                if (TEE != null)
+                    java.nio.file.Files.writeString(Path.of(TEE), s, StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE,
+                            java.nio.file.StandardOpenOption.APPEND);
                 in.write(s);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);

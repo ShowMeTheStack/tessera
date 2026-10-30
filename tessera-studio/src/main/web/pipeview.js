@@ -58,11 +58,16 @@
       const sch = r.schedule || [];
       this.sched.hidden = !sch.length;
       this.sched.replaceChildren(this.sched.firstChild, ...sch.map((s) => h('ul.pv-lines', ...s.lines.map((l) => h('li', l)))));
-      if (!r.pipes.length) {
+      const ooo = r.ooo || [];
+      if (!r.pipes.length && !ooo.length) {
         fill(this.body, h('div.help', 'The running design has no pipeline built with Tessera’s Pipeline, so there is nothing to draw. (The out-of-order core C7 is written without it.)'));
         return;
       }
-      fill(this.body, ...r.pipes.map((p) => this.table(p, r)));
+      if (!r.pipes.length) {
+        // an out-of-order core: its reorder buffer, an instruction per row from dispatch to commit
+        fill(this.body, h('div.help', 'An out-of-order core: there is no pipeline built with Tessera’s in-order Pipeline to draw by stages, so each row is an instruction in its reorder-buffer entry, from dispatch to commit.'),
+          ...ooo.map((p) => this.oooTable(p, r)));
+      } else fill(this.body, ...r.pipes.map((p) => this.table(p, r)), ...ooo.map((p) => this.oooTable(p, r)));
       const sc = this.body.closest('.pv-main');
       // a cycle's real width (two lanes write MEM·0, wider than MEM): when the window overflows, size it again
       const cells = r.to - r.from + 1, tw = this.body.scrollWidth, fw = this.root.clientWidth;
@@ -73,10 +78,24 @@
       if (this.at == null && sc) { sc.scrollTop = sc.scrollHeight; sc.scrollLeft = sc.scrollWidth; }
     }
 
+    // a reorder buffer: the same table (cells name where the instruction is), with each structure's occupancy below
+    oooTable(p, r) {
+      const d = this.table(p, r);
+      const cols = [];
+      for (let c = r.from; c <= r.to; c++) cols.push(c);
+      const occ = Object.entries(p.occupancy || {}).map(([k, v]) => h('tr.pv-occ', h('td.pv-ins', k + ' in use'),
+        ...cols.map((c, i) => h('td.pv-c', { title: 'cycle ' + c + ': ' + v[i] + ' ' + k + ' entries in use' }, v[i] == null ? '' : String(v[i])))));
+      if (occ.length) d.querySelector('tbody').append(...occ);
+      const key = d.querySelector('.pv-key');
+      if (key) key.replaceChildren(h('span.pv-c', 'RS'), ' in a reservation station ', h('span.pv-c', 'EX'), ' issued ', h('span.pv-c', 'LQ'), ' load in the load queue ',
+        h('span.pv-c', 'SQ'), ' store waiting in the store queue ', h('span.pv-c', 'OK'), ' done ', h('span.pv-c.fl', 'EX'), ' flushed ', h('span.pv-c.rt', 'OK'), ' committed');
+      return d;
+    }
+
     table(p, r) {
       const cols = [];
       for (let c = r.from; c <= r.to; c++) cols.push(c);
-      const head = h('tr', h('th.pv-ins', p.name + ' · ' + p.stages.join(' ') + (p.lanes > 1 ? ' · ' + p.lanes + ' lanes' : '')),
+      const head = h('tr', h('th.pv-ins', p.name + ' · ' + p.stages.join(' ') + (p.lanes > 1 ? ' · ' + p.lanes + ' lanes' : '') + (p.entries ? ' · ' + p.entries + ' entries' : '')),
         ...cols.map((c) => {
           const th = h('th.pv-cy' + (c === r.cycle ? '.now' : ''), { title: 'Go to cycle ' + c }, c % 5 === 0 ? String(c) : '');
           th.addEventListener('click', () => this.app.goto(c));
@@ -96,7 +115,7 @@
           if (cell === last && it.end === 'flushed') cls += '.fl';
           if (cell === last && it.end === 'retired') cls += '.rt';
           const name = p.stages[cell[1]] + (p.lanes > 1 ? '·' + cell[2] : '');
-          return h(cls, { title: 'cycle ' + c + ': ' + p.stages[cell[1]] + (p.lanes > 1 ? ', lane ' + cell[2] : '') + (cell[3] ? ' (waiting)' : '') }, name);
+          return h(cls, { title: 'cycle ' + c + ': ' + p.stages[cell[1]] + (p.lanes > 1 ? ', lane ' + cell[2] : '') + (p.entries ? ', reorder-buffer entry ' + cell[2] : '') + (cell[3] ? ' (waiting)' : '') }, name);
         }));
       });
       const t = h('table.pv-t', h('thead', head), h('tbody', ...rows));

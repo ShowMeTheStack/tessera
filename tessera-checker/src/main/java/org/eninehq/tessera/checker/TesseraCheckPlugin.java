@@ -45,6 +45,8 @@ import javax.tools.Diagnostic;
  *       (or annotated {@code @Stage(k)}) may not be used before it.</li>
  *   <li><b>{@code @Fn}</b>: such methods may not create registers, memories, instances or
  *       ports, nor assign signals.</li>
+ *   <li><b>{@code @Unsigned int/long}</b>: signed and unsigned values do not mix silently, and
+ *       operators with signed Java semantics on unsigned values are errors ({@link UnsignedCheck}).</li>
  * </ul>
  * Widths that are not known at compile time (constructor parameters, loops) are skipped;
  * elaboration still checks everything.
@@ -67,6 +69,7 @@ public final class TesseraCheckPlugin implements Plugin {
                 TreePath path = trees.getPath(e.getTypeElement());
                 if (path == null) return;
                 new Checker(trees, e.getCompilationUnit()).scan(path, null);
+                new UnsignedCheck(trees, e.getCompilationUnit(), UnsignedLowering.active(task)).scan(path, null);
             }
         });
     }

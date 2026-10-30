@@ -25,10 +25,32 @@
           button('Bounded', { icon: 'prove', title: 'No assertion fails within this many cycles of reset (BMC)', onclick: () => this.run('bmc') }),
           button('Induction', { icon: 'ok', title: 'Every assertion holds in every cycle (k-induction with this k)', onclick: () => this.run('prove') }),
           button('Cover', { icon: 'target', title: 'The first cycle each cover point can be reached', onclick: () => this.run('cover') })),
+        this.optionsBox(),
         h('div.sec', 'Results'), this.log);
       host.append(this.root);
       this.entries = [];
       this.render();
+    }
+
+    // the prover's options for several clocks and asynchronous resets (left at their defaults, nothing is sent)
+    optionsBox() {
+      const row = (...c) => h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', margin: '4px 0' } }, ...c);
+      this.optAsync = h('input', { type: 'checkbox', checked: true, 'aria-label': 'Asynchronous resets are free after reset' });   // the prover's default
+      this.optTick = h('input', { type: 'checkbox', 'aria-label': 'Some clock ticks at every step' });
+      this.optGap = h('input.input', { value: '0', inputmode: 'numeric', 'aria-label': 'Every clock ticks within this many steps', style: { width: '60px' } });
+      return h('details.prove-opts', h('summary', 'Options: several clocks, asynchronous resets'),
+        row(this.optAsync, h('label', { title: 'After the reset cycles, a reset input that drives an asynchronous reset may rise and fall at any step (otherwise it stays low)' }, 'Asynchronous resets may be pulsed after reset')),
+        row(this.optTick, h('label', { title: 'Assume some clock has an edge at every step' }, 'Some clock ticks at every step')),
+        row(h('label', { title: 'If more than 0: assume every clock has an edge within this many steps' }, 'Every clock ticks within'), this.optGap, h('span', { style: { color: 'var(--muted)' } }, 'steps (0: no bound)')));
+    }
+
+    options() {
+      const o = {};
+      if (this.optAsync && !this.optAsync.checked) o.freeAsyncResets = false;
+      if (this.optTick && this.optTick.checked) o.atLeastOneTick = true;
+      const g = Math.max(0, Math.floor(Number(this.optGap && this.optGap.value) || 0));
+      if (g > 0) o.maxTickGap = g;
+      return o;
     }
 
     render() {
@@ -47,7 +69,7 @@
       const depth = Math.max(1, Math.min(400, Number(this.depth.value) || 20));
       const pending = this.entry('…', (mode === 'bmc' ? 'Bounded check to ' : mode === 'prove' ? 'Induction with k = ' : 'Cover search to ') + depth + ' cycles', 'running');
       try {
-        const r = await S.Api.call('prove', { mode, depth });
+        const r = await S.Api.call('prove', { mode, depth, ...this.options() });
         pending.el.remove();
         this.entries = this.entries.filter((e) => e !== pending);
         if (mode === 'cover') {

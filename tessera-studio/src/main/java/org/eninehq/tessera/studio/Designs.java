@@ -49,37 +49,105 @@ public final class Designs {
         return w;
     }
 
+    /**
+     * The groups of cores besides {@code Cores.ALL}: the field of {@code Cores} that lists them, and the heading the
+     * studio shows. A field the tessera-riscv on the class path does not have is skipped.
+     */
+    static final java.util.List<String[]> VARIANT_GROUPS = java.util.List.of(
+            new String[]{"OOO_VARIANTS", "Out-of-order variants of C11"},
+            new String[]{"GENERATED", "Generated from one model (out-of-order and in-order generators)"},
+            new String[]{"SYMMETRIC_VARIANTS", "Dual issue, memory in both lanes (true dual-port memory)"},
+            new String[]{"LVT_VARIANTS", "Dual issue, live-value-table register file"},
+            new String[]{"PREDICT_VARIANTS", "Branch predictors (BTB, gshare, return-address stack)"},
+            new String[]{"GSHARE_SWEEP", "gshare history sweep"},
+            new String[]{"MUL_VARIANTS", "Where the multiply finishes"},
+            new String[]{"BEFORE", "Earlier schedules of C5 and C6"});
+
+    /** The heading of the main cores ({@code Cores.ALL}) in {@link #GROUPS}. */
+    static final String MAIN_GROUP = "Main cores";
+
+    /** The heading of the designs registered with {@code --designs} in {@link #GROUPS}. */
+    static final String REGISTERED_GROUP = "Registered designs";
+
+    /** The designs of the last {@link #available} by group, in order: the main cores, registered designs, then each variant group. */
+    static final Map<String, java.util.List<String>> GROUPS = new LinkedHashMap<>();
+
+    /**
+     * The groups as the {@code designGroups} API sends them: [{group, flat, designs: [name, ...]}], empty groups left
+     * out; {@code flat} (the main cores and registered designs) are listed in the designs menu itself, the others
+     * in a submenu each.
+     */
+    static java.util.List<Object> groupsJson() {
+        var out = new java.util.ArrayList<Object>();
+        GROUPS.forEach((g, l) -> {
+            if (!l.isEmpty()) out.add(Map.of("group", g, "flat", g.equals(MAIN_GROUP) || g.equals(REGISTERED_GROUP), "designs", java.util.List.copyOf(l)));
+        });
+        return out;
+    }
+
+    /**
+     * The designs: the main cores ({@code Cores.ALL}) in their order, then the designs of the registries (the
+     * order these two always had), then the variant cores of {@link #VARIANT_GROUPS}, group by group.
+     */
     @SuppressWarnings("unchecked")
     public static Map<String, Supplier<? extends Module>> available(java.util.List<String> registries) {
         var m = new LinkedHashMap<String, Supplier<? extends Module>>();
+        GROUPS.clear();
+        var variants = new LinkedHashMap<String, java.util.List<?>>();
+        int[] prog = null;
+        java.lang.reflect.Method idOf = null, nameOf = null, buildOf = null;
         try {
             Class<?> cores = Class.forName("org.eninehq.tessera.riscv.Cores");
             Class<?> bench = Class.forName("org.eninehq.tessera.riscv.Benchmarks");
-            int[] prog = (int[]) bench.getMethod("loop", int.class).invoke(null, 1_000_000);
-            for (Object spec : (java.util.List<?>) cores.getField("ALL").get(null)) {
-                var rec = spec.getClass();
-                String id = (String) rec.getMethod("id").invoke(spec), name = (String) rec.getMethod("name").invoke(spec);
-                var build = rec.getMethod("build", int.class, int[].class);
-                m.put(id + " " + name, () -> {
-                    try { return (Module) build.invoke(spec, 4096, prog); } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
-                });
-                CORES.put(id + " " + name, image -> {
-                    try { return (Module) build.invoke(spec, 4096, image == null ? prog : image); } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
-                });
+            prog = (int[]) bench.getMethod("loop", int.class).invoke(null, 1_000_000);
+            Class<?> spec = Class.forName("org.eninehq.tessera.riscv.Cores$Spec");
+            idOf = spec.getMethod("id");
+            nameOf = spec.getMethod("name");
+            buildOf = spec.getMethod("build", int.class, int[].class);
+            GROUPS.put(MAIN_GROUP, addCores(m, (java.util.List<?>) cores.getField("ALL").get(null), prog, idOf, nameOf, buildOf));
+            for (String[] g : VARIANT_GROUPS) {
+                try { variants.put(g[1], (java.util.List<?>) cores.getField(g[0]).get(null)); }
+                catch (NoSuchFieldException e) { /* an older tessera-riscv */ }
             }
         } catch (ClassNotFoundException e) {
             // tessera-riscv is not on the class path
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("cannot list the RISC-V cores: " + e);
         }
+        var registered = new java.util.ArrayList<String>();
         for (String r : registries) {
             try {
                 var got = (Map<String, Supplier<? extends Module>>) Class.forName(r).getMethod("studioDesigns").invoke(null);
                 m.putAll(got);
+                registered.addAll(got.keySet());
             } catch (ReflectiveOperationException e) {
                 throw new IllegalArgumentException("--designs " + r + ": needs a static studioDesigns() method (" + e + ")");
             }
         }
+        GROUPS.put(REGISTERED_GROUP, registered);
+        try {
+            for (var g : variants.entrySet()) GROUPS.put(g.getKey(), addCores(m, g.getValue(), prog, idOf, nameOf, buildOf));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot list the RISC-V core variants: " + e);
+        }
         return m;
+    }
+
+    /** The cores of a {@code Cores} list, into {@code m} and {@link #CORES} (a name already there is not added again); their names. */
+    private static java.util.List<String> addCores(Map<String, Supplier<? extends Module>> m, java.util.List<?> specs, int[] prog,
+            java.lang.reflect.Method idOf, java.lang.reflect.Method nameOf, java.lang.reflect.Method build) throws ReflectiveOperationException {
+        var names = new java.util.ArrayList<String>();
+        for (Object spec : specs) {
+            String key = idOf.invoke(spec) + " " + nameOf.invoke(spec);
+            if (m.containsKey(key)) continue;
+            names.add(key);
+            m.put(key, () -> {
+                try { return (Module) build.invoke(spec, 4096, prog); } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+            });
+            CORES.put(key, image -> {
+                try { return (Module) build.invoke(spec, 4096, image == null ? prog : image); } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+            });
+        }
+        return names;
     }
 }

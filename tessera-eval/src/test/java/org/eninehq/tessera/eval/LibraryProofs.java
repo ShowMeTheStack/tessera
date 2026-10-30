@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 import org.eninehq.tessera.core.Bool;
+import org.eninehq.tessera.core.ClockDomain;
 import org.eninehq.tessera.core.Elaborated;
 import org.eninehq.tessera.core.Module;
 import org.eninehq.tessera.core.Tessera;
@@ -22,7 +23,9 @@ import org.eninehq.tessera.core.UInt;
 import org.eninehq.tessera.formal.Formal;
 import org.eninehq.tessera.formal.YosysFormal;
 import org.eninehq.tessera.stdlib.Arbiter;
+import org.eninehq.tessera.stdlib.AsyncFifo;
 import org.eninehq.tessera.stdlib.Fifo;
+import org.eninehq.tessera.stdlib.LiveValueTable;
 import org.eninehq.tessera.stdlib.RegFile;
 import org.eninehq.tessera.stdlib.Util;
 import org.junit.jupiter.api.AfterAll;
@@ -52,6 +55,39 @@ class LibraryProofs {
             assertThat(f.count.zext(8).eq(seqIn.subWrap(seqOut)), "fifo_count");
             // ready when not full, or when full and an item leaves in the same cycle
             assertThat(f.in.ready().eq(f.count.ne(depth).or(pop)), "fifo_ready_iff_room");
+        }
+    }
+
+    /**
+     * The asynchronous FIFO across two independent clocks: items leave in the order they entered, none lost or
+     * duplicated (the read side checks sequence numbers), and the occupancy, items written minus items read, stays
+     * within 0..depth (no overflow, no underflow), checked on both clocks.
+     */
+    static class AsyncFifoOrder extends Module {
+        AsyncFifoOrder(int depth) {
+            this(depth, 0);
+        }
+
+        /** {@code broken}: 1 = the writer counts a push even when the FIFO is full; 2 = the reader pops when empty (negative controls). */
+        AsyncFifoOrder(int depth, int broken) {
+            ClockDomain wr = clockDomain("wr"), rd = clockDomain("rd");
+            AsyncFifo<UInt> f = instance("f", () -> new AsyncFifo<>(UInt.w(8), depth));
+            connectClock(f.wr, wr);
+            connectClock(f.rd, rd);
+            Bool push = input("push", Bool.TYPE), pop = input("pop", Bool.TYPE);
+            UInt seqIn = withClock(wr, () -> reg("seq_in", UInt.w(8), 0));
+            UInt seqOut = withClock(rd, () -> reg("seq_out", UInt.w(8), 0));
+            f.in.valid().set(push);
+            f.in.bits().set(seqIn);
+            f.out.ready().set(pop);
+            when(broken == 1 ? push : push.and(f.in.ready()), () -> seqIn.set(seqIn.addWrap(1)));
+            when(broken == 2 ? pop : pop.and(f.out.valid()), () -> seqOut.set(seqOut.addWrap(1)));
+            UInt occupancy = seqIn.subWrap(seqOut);
+            withClock(rd, () -> {
+                assertThat(f.out.valid().not().or(f.out.bits().eq(seqOut)), "async_fifo_order");
+                assertThat(occupancy.le(depth), "async_fifo_bound_rd");
+            });
+            withClock(wr, () -> assertThat(occupancy.le(depth), "async_fifo_bound_wr"));
         }
     }
 
@@ -136,6 +172,68 @@ class LibraryProofs {
         }
     }
 
+    /**
+     * The live-value-table register file is the register array it replaces: two write ports (the later one,
+     * port 1, wins when both write one register, as in program order), {@code reads} combinational reads, with or
+     * without x0. The shadow-copy pattern of {@link RegFileRaw} for one arbitrary register {@code at}, with the second
+     * write port; built in this module ({@link LiveValueTable}) so that the strengthening assertions can name the
+     * table and the banks. Those are asserted (so proven too), not assumed: the table entry of {@code at} names the
+     * port that wrote it last, and every copy of that port's bank holds the value at {@code at}. Without them
+     * k-induction cannot close (copies of one bank could differ in an unreachable state).
+     * With {@code port0Wins} the reference is wrong for same-cycle writes: a negative control that must fail.
+     */
+    static class LvtRaw extends Module {
+        LvtRaw(int count, int width, int reads, boolean zero, boolean aided, boolean port0Wins) {
+            int aw = Math.max(1, 32 - Integer.numberOfLeadingZeros(count - 1));
+            Bool we0 = input("we0", Bool.TYPE), we1 = input("we1", Bool.TYPE);
+            UInt wa0 = input("wa0", UInt.w(aw)), wa1 = input("wa1", UInt.w(aw));
+            UInt wd0 = input("wd0", UInt.w(width)), wd1 = input("wd1", UInt.w(width));
+            var lvt = new LiveValueTable("rf", count, width, zero);
+            when(we0, () -> lvt.write(wa0, wd0));
+            when(we1, () -> lvt.write(wa1, wd1));
+            UInt[] ra = new UInt[reads], rd = new UInt[reads];
+            for (int r = 0; r < reads; r++) {
+                ra[r] = input("ra" + r, UInt.w(aw));
+                rd[r] = lvt.read(ra[r]);
+            }
+            lvt.close();
+            // an arbitrary register, chosen in the first cycle and fixed afterwards
+            UInt sel = input("sel", UInt.w(aw));
+            Bool chosen = reg("chosen", Bool.TYPE, 0);
+            UInt at = reg("at", UInt.w(aw), 0);
+            when(chosen.not(), () -> {
+                at.set(sel);
+                chosen.set(true);
+            });
+            // the register array: the last write to `at`, port 1 after port 0 (x0 is never written)
+            Bool writable = zero ? at.ne(0) : Bool.of(true);
+            Bool hit0 = chosen.and(we0).and(wa0.eq(at)).and(writable), hit1 = chosen.and(we1).and(wa1.eq(at)).and(writable);
+            Bool known = reg("known", Bool.TYPE, 0), last = reg("last", Bool.TYPE, 0);
+            UInt shadow = reg("shadow", UInt.w(width), 0);
+            Bool second = port0Wins ? hit1.and(hit0.not()) : hit1;
+            when(hit0.or(hit1), () -> {
+                known.set(true);
+                shadow.set(mux(second, wd1, wd0));
+                last.set(second);
+            });
+            for (int r = 0; r < reads; r++) {
+                assertThat(known.and(ra[r].eq(at)).not().or(rd[r].eq(shadow)), "read_" + r + "_returns_last_write");
+                if (zero) assertThat(ra[r].ne(0).or(rd[r].eq(0)), "read_" + r + "_x0_is_zero");
+            }
+            if (aided) {
+                assertThat(known.not().or(chosen), "known_only_after_choosing");
+                // x0 is never written, so it is never known (else an unreachable state with a stale shadow for x0)
+                if (zero) assertThat(known.not().or(at.ne(0)), "x0_never_known");
+                assertThat(known.not().or(lvt.table().read(at).eq(mux(last, UInt.lit(1, 1), UInt.lit(0, 1)))), "table_names_last_writer");
+                for (int w = 0; w < 2; w++)
+                    for (int r = 0; r < reads; r++) {
+                        Bool mine = w == 1 ? last : last.not();
+                        assertThat(known.and(mine).not().or(lvt.copy(w, r).read(at).eq(shadow)), "bank_" + w + "_copy_" + r + "_holds_it");
+                    }
+            }
+        }
+    }
+
     /** Debounce: the output follows the input only after it has been stable for 3 cycles. */
     static class Debounce extends Module {
         Debounce() {
@@ -161,7 +259,12 @@ class LibraryProofs {
         }
     }
 
-    record Case(String name, Supplier<? extends Module> design, int bmcDepth, int k) {
+    /** {@code resetCycles}: cycles the reset is held (with an edge of every clock); 3 flushes 2-stage synchronizers. */
+    record Case(String name, Supplier<? extends Module> design, int bmcDepth, int k, int resetCycles) {
+        Case(String name, Supplier<? extends Module> design, int bmcDepth, int k) {
+            this(name, design, bmcDepth, k, 1);
+        }
+
         @Override public String toString() { return name; }
     }
 
@@ -179,11 +282,29 @@ class LibraryProofs {
                 new Case("gray code, 8 bits", Gray::new, 1, 1),
                 new Case("priority encoder, 16 bits", Priority::new, 1, 1),
                 new Case("register file read-after-write", RegFileRaw::new, 12, 4),
+                // 32 registers, 4 reads + the debug read, 2 writes, at 8 bits: this suite's yices closes the 32-bit
+                // induction step only slowly (> 45 min); 32 x 32 is proven in LvtProofs with bitwuzla
+                new Case("LVT register file = 2-write array, 32x8, 5 reads", () -> new LvtRaw(32, 8, 5, false, true, false), 12, 2),
+                new Case("LVT register file = 2-write array, 32x8, 5 reads, x0", () -> new LvtRaw(32, 8, 5, true, true, false), 12, 2),
                 new Case("debounce, 3 cycles", Debounce::new, 16, 6),
-                new Case("LFSR, 16 bits", Lfsr::new, 16, 1));
+                new Case("LFSR, 16 bits", Lfsr::new, 16, 1),
+                // two independent clocks; the synchronizers' flip-flops have no reset, so the reset is held 3 cycles
+                new Case("async fifo depth 4, two clocks", () -> new AsyncFifoOrder(4), 16, 8, 3));
     }
 
     static final Map<String, String> ROWS = new TreeMap<>();
+
+    /** Negative controls for the asynchronous FIFO's properties: each broken wrapper must fail, and the counterexample replays. */
+    @ParameterizedTest(name = "broken={0}")
+    @org.junit.jupiter.params.provider.ValueSource(ints = {1, 2})
+    void asyncFifoPropertiesCatchMisuse(int broken) {
+        assumeTrue(Formal.Options.defaults().solver() != null);
+        var e = Tessera.elaborate(() -> new AsyncFifoOrder(4, broken));
+        var r = Formal.bmc(e.circuit(), 16, Formal.Options.defaults().withResetCycles(3));
+        org.junit.jupiter.api.Assertions.assertEquals(Formal.Status.FAIL, r.status(), r.toString());
+        org.junit.jupiter.api.Assertions.assertNotNull(r.replay(null), "replays in simulation: " + r);
+        System.out.println("async fifo broken=" + broken + ": " + r);
+    }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("cases")
@@ -192,7 +313,7 @@ class LibraryProofs {
         assumeTrue(YosysFormal.available(), "needs yices and yosys-smtbmc");
         Elaborated<? extends Module> e = Tessera.elaborate(c.design());
         // yices for both engines, so the comparison with yosys-smtbmc is like for like
-        var opt = Formal.Options.defaults().withSolver("yices-smt2");
+        var opt = Formal.Options.defaults().withSolver("yices-smt2").withResetCycles(c.resetCycles());
         long t0 = System.nanoTime();
         var bmc = Formal.bmc(e.circuit(), c.bmcDepth(), opt);
         double bmcS = (System.nanoTime() - t0) / 1e9;
@@ -205,7 +326,7 @@ class LibraryProofs {
         if (YosysFormal.available()) {
             Path dir = Files.createTempDirectory("ysmt");
             t0 = System.nanoTime();
-            var y = YosysFormal.bmc(e.circuit(), dir, c.bmcDepth(), "yices");
+            var y = YosysFormal.bmc(e.circuit(), dir, c.bmcDepth(), "yices", opt);
             yS = (System.nanoTime() - t0) / 1e9;
             yosys = y.failed() ? "FAIL" : "PASS";
         }

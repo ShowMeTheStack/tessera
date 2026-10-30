@@ -14,6 +14,7 @@ include(
     "tessera-formal",
     "tessera-cli",
     "tessera-checker",
+    "tessera-syntax-lite",
     "tessera-playground",
     "tessera-studio",
     "tessera-fpga",
@@ -22,12 +23,12 @@ include(
     "tessera-eval",
 )
 
-// The Babylon front end needs a Babylon (code reflection) JDK; see tessera-babylon/README.md
+// The Babylon front end needs a Babylon (code reflection) JDK; see README.md
 val babylonJdk = providers.gradleProperty("tessera.babylonJdk")
     .orElse(System.getProperty("user.home") + "/tessera-jdk/babylon/build/macosx-aarch64-server-release/images/jdk").get()
 if (file("$babylonJdk/bin/javac").exists()) include("tessera-babylon")
 
-// Designs written with the Tessera javac syntax; see javac-fork/README.md
+// Designs written with the Tessera javac syntax; see README.md
 val tesseraJdk = providers.gradleProperty("tessera.syntaxJdk")
     .orElse(System.getProperty("user.home") + "/tessera-jdk/jdk25-tessera/build/macosx-aarch64-server-release/images/jdk").get()
 if (file("$tesseraJdk/bin/javac").exists()) include("examples-syntax")

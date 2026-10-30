@@ -7,8 +7,8 @@ HOST=${ZED_HOST:-user@zed-host}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 P=${1:-5}
 "$ROOT/gradlew" -q -p "$ROOT" :tessera-fpga:qorExport
-ssh $HOST "sudo rm -rf tessera-zed/qor && mkdir -p tessera-zed/qor"
-scp -q -r "$ROOT"/tessera-fpga/build/qor/* "$ROOT/tessera-fpga/vivado/qor.tcl" $HOST:tessera-zed/qor/
+ssh $HOST "sudo rm -rf tessera-builds/qor && mkdir -p tessera-builds/qor"
+scp -q -r "$ROOT"/tessera-fpga/build/qor/* "$ROOT/tessera-fpga/vivado/qor.tcl" $HOST:tessera-builds/qor/
 # name top clock files
 JOBS="tessera_sched3:top:clock:core.sv,top.v tessera_sched4:top:clock:core.sv,top.v tessera_sched5:top:clock:core.sv,top.v
 tessera_sched6:top:clock:core.sv,top.v tessera_ooo:top:clock:core.sv,top.v tessera_fpga5:top:clock:core.sv,top.v
@@ -18,7 +18,7 @@ i=0
 for j in $JOBS; do
   name=${j%%:*}; rest=${j#*:}; top=${rest%%:*}; rest=${rest#*:}; clk=${rest%%:*}; files=$(echo ${rest#*:} | tr ',' ' ')
   cpus="$((i*2))-$((i*2+1))"; i=$((i+1))
-  ssh $HOST "cd tessera-zed/qor/$name && sudo docker run --rm --cpuset-cpus=$cpus -v \$PWD:/w -v \$HOME/tessera-zed/qor/qor.tcl:/qor.tcl -w /w kkrizka/vivado:2020.1 bash -c 'source /opt/Xilinx/Vivado/2020.1/settings64.sh; vivado -mode batch -nojournal -nolog -source /qor.tcl -tclargs $top $clk $P $files > vivado.log 2>&1'; grep QOR vivado.log || (echo \"$name FAILED\"; grep ERROR vivado.log | head -3)" &
+  ssh $HOST "cd tessera-builds/qor/$name && sudo docker run --rm --cpuset-cpus=$cpus -v \$PWD:/w -v \$HOME/tessera-builds/qor/qor.tcl:/qor.tcl -w /w kkrizka/vivado:2020.1 bash -c 'source /opt/Xilinx/Vivado/2020.1/settings64.sh; vivado -mode batch -nojournal -nolog -source /qor.tcl -tclargs $top $clk $P $files > vivado.log 2>&1'; grep QOR vivado.log || (echo \"$name FAILED\"; grep ERROR vivado.log | head -3)" &
 done
 wait
-ssh $HOST "sudo chown -R \$(id -u):\$(id -g) tessera-zed/qor; grep -h '^QOR' tessera-zed/qor/*/vivado.log" | tee "$ROOT/build/qor-results.txt"
+ssh $HOST "sudo chown -R \$(id -u):\$(id -g) tessera-builds/qor; grep -h '^QOR' tessera-builds/qor/*/vivado.log" | tee "$ROOT/build/qor-results.txt"

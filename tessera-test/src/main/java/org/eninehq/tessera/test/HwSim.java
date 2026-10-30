@@ -102,6 +102,7 @@ public final class HwSim<M extends Module> implements Simulator {
     @Override public Map<String, BigInteger> registerState() { return sim.registerState(); }
     @Override public int loadRegisterState(Map<String, BigInteger> state) { recordable = false; return sim.loadRegisterState(state); }
     @Override public void addListener(Listener l) { sim.addListener(l); }
+    @Override public void addMemoryWriteListener(org.eninehq.tessera.core.Mem<?> mem, MemoryWriteListener l) { sim.addMemoryWriteListener(mem, l); }
     @Override public void trace(Path file) { sim.trace(file); }
     @Override public Netlist netlist() { return sim.netlist(); }
     @Override public void close() { sim.close(); }

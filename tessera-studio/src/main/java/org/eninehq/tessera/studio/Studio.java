@@ -128,6 +128,7 @@ public final class Studio implements AutoCloseable {
             case "bench" -> session.bench(req);
             case "prove" -> session.prove(req);
             case "designs" -> new ArrayList<>(designs.keySet());
+            case "designGroups" -> Designs.groupsJson();
             case "programs" -> Map.of("cores", new ArrayList<>(Designs.CORES.keySet()), "programs", new ArrayList<>(Designs.programs().keySet()));
             case "modules" -> modules.list();
             case "analyse" -> session.analyse(req);

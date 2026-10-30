@@ -1288,6 +1288,84 @@ public class Parity extends Module {
   return page;
 });
 
+// ---------------------------------------------------------------- core variants, out-of-order view, prover options
+
+spec('cores', 'the designs menu groups the core variants in submenus, and C11-tdp opens from its group', async () => {
+  const page = await open();
+  await page.locator('button.btn .lb', { hasText: /^Designs$/ }).click();
+  await page.waitForSelector('.menu .mi');
+  const top = await page.evaluate(() => [...document.querySelectorAll('.menu .mi')].map((e) => e.textContent));
+  expect(top.some((t) => t.startsWith('C11 out-of-order')), 'C11 in the menu itself');
+  expect(!top.some((t) => t.startsWith('C11-tdp')), 'variants are not in the menu itself');
+  for (const g of ['Out-of-order variants of C11 (2)', 'Generated from one model', 'Dual issue, memory in both lanes', 'Dual issue, live-value-table register file', 'Branch predictors'])
+    expect(top.some((t) => t.startsWith(g)), 'group ' + g + ' in ' + top.join(' / '));
+  await page.locator('.menu .mi', { hasText: 'Out-of-order variants of C11' }).click();
+  await page.waitForFunction(() => [...document.querySelectorAll('.menu .mi')].some((e) => e.textContent.startsWith('C11-tdp')));
+  await page.locator('.menu .mi', { hasText: 'C11-tdp' }).click();
+  // a core takes a program: the dialog opens with the benchmark loop chosen
+  await page.waitForSelector('.modal');
+  await page.locator('.modal button', { hasText: 'Open' }).click();
+  await page.waitForFunction(() => Studio.app.explorer && /C11-tdp/.test(Studio.app.message || ''), null, { timeout: 30000 });
+  return page;
+});
+
+spec('cores', 'the out-of-order C11 draws its reorder buffer: instructions from dispatch to commit, with ROB, RS, LQ, SQ and checkpoint occupancy', async () => {
+  const page = await open();
+  await page.evaluate(() => Studio.app.openDesign('C11 out-of-order with execute-time branch recovery and a load/store queue, 16-entry ROB / 8 RS / 4 checkpoints / 4+4 LSQ'));
+  await page.waitForFunction(() => Studio.app.explorer && /C11/.test(Studio.app.message || ''), null, { timeout: 30000 });
+  await sim(page, { cmd: 'restart' });
+  const c = (await sim(page, { cmd: 'step', n: 200 })).cycle;
+  await page.waitForFunction((c) => Studio.app.cycle === c, c, { timeout: 5000 });
+  await page.locator('.tab[data-tab="pipe"]').click();
+  await page.waitForFunction(() => document.querySelectorAll('.pv-row').length > 10, null, { timeout: 10000 });
+  const d = await page.evaluate(() => ({
+    head: document.querySelector('.pv-t th.pv-ins').textContent,
+    help: document.querySelector('.pv-body .help').textContent,
+    retired: document.querySelectorAll('.pv-c.rt').length,
+    occ: [...document.querySelectorAll('.pv-occ td.pv-ins')].map((e) => e.textContent),
+    text: [...document.querySelectorAll('.pv-row td.pv-ins')].map((e) => e.textContent).join(' | '),
+    title: document.querySelector('.pv-row td.pv-c')?.title,
+  }));
+  expect(d.head.includes('RS EX LQ SQ OK') && d.head.includes('16 entries'), 'states and entries: ' + d.head);
+  expect(/no pipeline built with Tessera/.test(d.help), 'says why it is not drawn by stages: ' + d.help);
+  expect(d.retired > 5, 'committed cells: ' + d.retired);
+  eq(d.occ.join(','), 'ROB in use,RS in use,LQ in use,SQ in use,checkpoints in use', 'occupancy rows');
+  expect(/addi|add|bne|blt|jal|lw|sw/.test(d.text), 'rows are disassembled: ' + d.text.slice(0, 120));
+  expect(/reorder-buffer entry \d+/.test(d.title || ''), 'a cell names its entry: ' + d.title);
+  page.measure = d.retired + ' committed cells';
+  return page;
+});
+
+spec('cores', 'C9-lvt runs rv32ui-add live: gp = 1, read through the live-value-table register file', async () => {
+  const page = await open();
+  await page.evaluate(() => Studio.app.openDesign('C9-lvt dual-issue five-stage, live-value-table register file', 'rv32ui-add'));
+  await page.waitForFunction(() => Studio.app.explorer && /C9-lvt/.test(Studio.app.message || ''), null, { timeout: 30000 });
+  await sim(page, { cmd: 'restart' });
+  await sim(page, { cmd: 'rate', rate: 0 });
+  await sim(page, { cmd: 'until', expr: 'core_halted == 1' });
+  await page.waitForFunction(() => !Studio.app.running && /holds/.test(Studio.app.message || ''), null, { timeout: 30000 });
+  const r = await page.evaluate(() => Studio.Api.call('mem', { path: 'regs', from: 3, count: 1 }));
+  eq(r.words[0], '1', 'gp');
+  eq(r.lvt, 2, 'two banks');
+  page.measure = 'x3=' + r.words[0] + ' at cycle ' + r.cycle;
+  return page;
+});
+
+spec('cores', 'the Prove pane has the multi-clock options and sends the ones changed from the defaults', async () => {
+  const page = await open();
+  await page.evaluate(() => Studio.app.showTab('prove'));
+  await page.locator('.prove-opts summary').click();
+  expect(await page.locator('.prove-opts input[type=checkbox]').first().isChecked(), 'asynchronous resets free: the prover\'s default');
+  await page.locator('.prove-opts input.input').fill('2');
+  await page.evaluate(() => { const call = Studio.Api.call; Studio.Api.call = (n, b) => { if (n === 'prove') window.sentProve = b; return call(n, b); }; });
+  await page.locator('button', { hasText: 'Bounded' }).click();
+  await page.waitForFunction(() => window.sentProve && !Studio.app.prove.busy, null, { timeout: 30000 });
+  const b = await page.evaluate(() => window.sentProve);
+  eq(b.maxTickGap, 2, 'maxTickGap sent');
+  expect(!('freeAsyncResets' in b) && !('atLeastOneTick' in b), 'defaults not sent: ' + JSON.stringify(b));
+  return page;
+});
+
 // ---------------------------------------------------------------- run
 
 const rows = [];

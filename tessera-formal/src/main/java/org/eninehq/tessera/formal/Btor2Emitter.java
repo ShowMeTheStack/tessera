@@ -16,6 +16,13 @@ import org.eninehq.tessera.sim.Netlist;
  * competition, read by btormc, pono, AVR, ...). Assertions become {@code bad} properties and
  * assumptions {@code constraint}s. An extra state {@code tessera_first} is 1 in the first
  * cycle only; it holds the reset inputs active in that cycle, as {@link Formal#bmc} does.
+ *
+ * <p>Clocks and asynchronous resets follow {@link SmtUnroller}: with several clock domains, each
+ * has a free 1-bit input named after its clock that says whether the domain has an edge in this
+ * cycle (forced to 1 in the first cycle); a register's state is kept when its domain has no edge,
+ * and its properties and memory writes are disabled. A register with an asynchronous reset shows
+ * its reset value while the reset is active, and stores it; a reset input that drives an
+ * asynchronous reset is free after the first cycle (the default of {@link Formal.Options}).
  */
 public final class Btor2Emitter {
     private static final OpKind[] KINDS = OpKind.values();
@@ -33,19 +40,33 @@ public final class Btor2Emitter {
     private final List<Integer> inputWidths = new ArrayList<>();
     private final List<String> stateOrder = new ArrayList<>();
     private final List<Integer> stateWidths = new ArrayList<>();
+    /** State nodes of the registers (for an asynchronous reset, the stored value; slotNode holds the visible one). */
+    private final Map<Integer, Integer> stateNode = new HashMap<>();
+    private final Map<Integer, Netlist.Reg> asyncRegs = new LinkedHashMap<>();
+    private final Map<Integer, Netlist.Insn> producer = new HashMap<>();
+    private final java.util.Set<Integer> busy = new java.util.HashSet<>();
+    /** Tick input of each domain (with several domains). */
+    private final List<Integer> tickNode = new ArrayList<>();
 
     private Btor2Emitter(Netlist net) {
         this.net = net;
+        for (var r : net.regs()) if (r.hasReset() && r.asyncReset()) asyncRegs.put(r.slot(), r);
+        for (var in : net.insns()) producer.put(in.dst(), in);
     }
 
-    /** The BTOR2 text and the order of its inputs (for writing witnesses). */
-    public record Model(String text, List<String> inputs, List<Integer> inputWidths, List<String> states, List<Integer> stateWidths) {}
+    /**
+     * The BTOR2 text and the order of its inputs (for writing witnesses). {@code clocks} names the
+     * inputs that are clock ticks (empty with one clock).
+     */
+    public record Model(String text, List<String> inputs, List<Integer> inputWidths, List<String> states, List<Integer> stateWidths,
+                        List<String> clocks) {}
 
     public static Model emit(Netlist net) {
         var e = new Btor2Emitter(net);
         e.run();
         return new Model(e.out.toString(), List.copyOf(e.inputOrder), List.copyOf(e.inputWidths),
-                java.util.Collections.unmodifiableList(new ArrayList<>(e.stateOrder)), List.copyOf(e.stateWidths));
+                java.util.Collections.unmodifiableList(new ArrayList<>(e.stateOrder)), List.copyOf(e.stateWidths),
+                net.clockPaths().size() > 1 ? List.copyOf(net.clockPaths()) : List.of());
     }
 
     private int line(String s) {
@@ -71,6 +92,24 @@ public final class Btor2Emitter {
         Integer n = slotNode.get(slot);
         if (n != null) return n;
         int w = net.slotWidth(slot);
+        var ar = asyncRegs.get(slot);
+        var in = producer.get(slot);
+        if (ar != null || in != null) {
+            // defined out of order: the visible value of an asynchronous-reset register, or logic it needs
+            if (!busy.add(slot))
+                throw new IllegalStateException("the asynchronous reset of register " + (ar != null ? ar.path() : "slot " + slot)
+                        + " depends combinationally on its own value; the formal back end does not support that");
+            if (ar != null) {
+                int active = line("eq " + sort(1) + " " + node(ar.resetSlot()) + " " + constant(BigInteger.valueOf(ar.resetActive()), 1));
+                n = line("ite " + sort(w) + " " + active + " " + constant(BitVec.toBig(ar.resetWords(), 0, w), w) + " "
+                        + stateNode.get(slot));
+            } else {
+                n = insn(in);
+            }
+            busy.remove(slot);
+            slotNode.put(slot, n);
+            return n;
+        }
         if (net.isConstant(slot)) {
             n = constant(BitVec.toBig(net.initialValues(), slot, w), w);
         } else {
@@ -90,6 +129,13 @@ public final class Btor2Emitter {
             inputOrder.add(e.getKey());
             inputWidths.add(w);
         }
+        int domains = net.clockPaths().size();
+        if (domains > 1)
+            for (var clk : net.clockPaths()) {
+                tickNode.add(line("input " + sort(1) + " " + clk));
+                inputOrder.add(clk);
+                inputWidths.add(1);
+            }
         // constants used as initial values must precede the states
         int one = constant(BigInteger.ONE, 1), zero = constant(BigInteger.ZERO, 1);
         var memZero = new HashMap<Integer, Integer>();
@@ -100,7 +146,8 @@ public final class Btor2Emitter {
         stateWidths.add(1);
         for (var r : net.regs()) {
             int s = line("state " + sort(r.width()) + " " + (r.path() == null ? "r" + r.slot() : r.path()));
-            slotNode.put(r.slot(), s);
+            stateNode.put(r.slot(), s);
+            if (!asyncRegs.containsKey(r.slot())) slotNode.put(r.slot(), s);
             stateOrder.add(r.path());
             stateWidths.add(r.width());
         }
@@ -113,7 +160,8 @@ public final class Btor2Emitter {
             stateWidths.add(0);
         }
         // combinational logic
-        for (var in : net.insns()) slotNode.put(in.dst(), insn(in));
+        for (var in : net.insns()) if (!slotNode.containsKey(in.dst())) slotNode.put(in.dst(), insn(in));
+        for (var r : asyncRegs.values()) node(r.slot());
         // initial values: the first-cycle flag, zero/initialised memories
         line("init " + sort(1) + " " + first + " " + one);
         line("next " + sort(1) + " " + first + " " + zero);
@@ -146,7 +194,8 @@ public final class Btor2Emitter {
                 nx = line("ite " + sort(r.width()) + " " + active + " "
                         + constant(BitVec.toBig(r.resetWords(), 0, r.width()), r.width()) + " " + nx);
             }
-            line("next " + sort(r.width()) + " " + slotNode.get(r.slot()) + " " + nx);
+            if (domains > 1) nx = line("ite " + sort(r.width()) + " " + tickNode.get(r.domain()) + " " + nx + " " + node(r.slot()));
+            line("next " + sort(r.width()) + " " + stateNode.get(r.slot()) + " " + nx);
         }
         for (int m = 0; m < net.mems().size(); m++) {
             var mem = net.mems().get(m);
@@ -159,23 +208,37 @@ public final class Btor2Emitter {
                 int en = node(w.en());
                 int inRange = inRange(node(w.addr()), net.slotWidth(w.addr()), mem.depth());
                 if (inRange > 0) en = line("and " + sort(1) + " " + en + " " + inRange);
+                if (domains > 1) en = line("and " + sort(1) + " " + tickNode.get(w.domain()) + " " + en);
                 v = line("ite " + memSort.get(m) + " " + en + " " + st + " " + v);
             }
             line("next " + memSort.get(m) + " " + memNode.get(m) + " " + v);
         }
         // resets: active in the first cycle, inactive afterwards
         var resets = new LinkedHashMap<Integer, Long>();
-        for (var r : net.regs()) if (r.hasReset()) resets.put(r.resetSlot(), r.resetActive());
+        var async = new java.util.HashSet<Integer>();
+        for (var r : net.regs()) {
+            if (!r.hasReset()) continue;
+            resets.put(r.resetSlot(), r.resetActive());
+            if (r.asyncReset()) async.add(r.resetSlot());
+        }
         for (var e : resets.entrySet()) {
             if (!net.inputSlots().containsValue(e.getKey())) continue;
             int lvl = line("eq " + sort(1) + " " + node(e.getKey()) + " " + constant(BigInteger.valueOf(e.getValue()), 1));
+            if (async.contains(e.getKey())) {
+                // an asynchronous reset: active in the first cycle, free afterwards
+                line("constraint " + line("or " + sort(1) + " -" + first + " " + lvl));
+                continue;
+            }
             // first ? active : !active
             int c = line("ite " + sort(1) + " " + first + " " + lvl + " -" + lvl);
             line("constraint " + c);
         }
+        // every clock has an edge in the first cycle
+        for (int k : tickNode) line("constraint " + line("or " + sort(1) + " -" + first + " " + k));
         // properties
         for (var ch : net.checks()) {
             int en = node(ch.en()), cond = node(ch.cond());
+            if (domains > 1) en = line("and " + sort(1) + " " + tickNode.get(ch.domain()) + " " + en);
             switch (ch.kind()) {
                 case ASSERT -> {
                     int bad = line("and " + sort(1) + " " + en + " -" + cond);
@@ -290,9 +353,11 @@ public final class Btor2Emitter {
         for (int t = 0; t < r.counterexample().size(); t++) {
             sb.append('@').append(t).append('\n');
             var row = r.counterexample().get(t);
+            var ticks = r.ticks() == null ? null : r.ticks().get(t);
             for (int i = 0; i < model.inputs().size(); i++) {
                 var name = model.inputs().get(i);
-                var v = row.getOrDefault(name, BigInteger.ZERO);
+                var v = ticks != null && model.clocks().contains(name) ? (ticks.contains(name) ? BigInteger.ONE : BigInteger.ZERO)
+                        : row.getOrDefault(name, BigInteger.ZERO);
                 sb.append(i).append(' ').append(bits(v, model.inputWidths().get(i))).append(' ').append(name).append('@').append(t).append('\n');
             }
         }

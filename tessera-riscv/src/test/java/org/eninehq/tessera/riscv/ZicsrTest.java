@@ -22,8 +22,12 @@ class ZicsrTest {
 
     /** Run on the core, check every retirement against the ISS; raise irq from {@code irqAt} (cycle) until the end. */
     static Rv32iIss cosim(Supplier<? extends RvCore> core, String program, long irqAt) {
+        return cosim(Tessera.elaborate(core), program, irqAt);
+    }
+
+    /** The same on an elaborated core, so that one elaboration serves many runs. */
+    static Rv32iIss cosim(Elaborated<? extends RvCore> e, String program, long irqAt) {
         int[] img = image(program);
-        Elaborated<? extends RvCore> e = Tessera.elaborate(core);
         var iss = new Rv32iIss(MEM, img, true);
         try (var sim = Sim.create(e, Sim.Backend.COMPILED)) {
             RvCore c = e.top();
@@ -34,6 +38,7 @@ class ZicsrTest {
                 imem[i] = Integer.toUnsignedLong(img[i]);
                 dmem[i] = Integer.toUnsignedLong(img[i]);
             }
+            var effects = new SideEffects(sim, c, iss);
             sim.reset(1);
             long start = sim.cycle(), retired = 0;
             var ports = c.retirePorts();
@@ -50,10 +55,12 @@ class ZicsrTest {
                     if (!got.equals(want)) fail("retire #" + retired + " differs:\n  core " + got + "\n  iss  " + want);
                     retired++;
                 }
+                effects.sample();
                 sim.step();
             }
             assertTrue(iss.halted, "ISS did not halt");
-            long[] regs = sim.memory(c.regs);
+            effects.check(dmem);
+            long[] regs = CoreRunner.regs(sim, c);
             for (int r = 1; r < 32; r++) assertEquals(iss.x[r], (int) regs[r], "x" + r);
         }
         return iss;
@@ -93,6 +100,27 @@ class ZicsrTest {
     @ValueSource(strings = {"single", "sched5", "sched3", "fpga", "ooo", "ooo-small", "ooo-fpga"})
     void externalInterrupt(String kind) {
         checkIrq(core(kind));
+    }
+
+    /**
+     * Side effects that retirements do not show: trapping stores must not write memory, and a CSR instruction
+     * held behind a divide must not write its CSR before it retires. The second runs with the interrupt raised
+     * at every 5th cycle of the loop, so that one of them arrives while the instruction is held.
+     */
+    static void checkSideEffects(Supplier<? extends RvCore> core) {
+        var e = Tessera.elaborate(core);
+        var iss = cosim(e, "sidefx-store", Long.MAX_VALUE);
+        assertEquals(0x11223344, s(iss, 1), "aligned sw");
+        assertEquals(0x00008800, s(iss, 2), "sb at offset 9; the misaligned sh at 5 did not write");
+        assertEquals(0x55667788, s(iss, 3), "the store behind the trapping load ran once, after the handler");
+        assertEquals(0x11223344, s(iss, 4), "the store behind the ecall ran once, after the handler");
+        assertEquals(0x55667788 / 3, s(iss, 5), "the quotient; the misaligned store behind the divide did not write");
+        assertEquals(5, s(iss, 6), "five traps");
+        for (long at = 0; at <= 400; at += 5) {
+            var r = cosim(e, "sidefx-irq", at);
+            assertEquals(1, s(r, 2), "handler ran, irq from cycle " + at);
+            assertEquals(23, s(r, 3), "mscratch after the loop, irq from cycle " + at);
+        }
     }
 
     static void checkCsr(Rv32iIss iss) {

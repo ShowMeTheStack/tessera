@@ -29,6 +29,19 @@ public final class MemDef {
         public SourceLoc loc() { return loc; }
     }
 
+    /**
+     * A port of a true dual-port RAM ({@code Mem.port}): one address, read synchronously into {@code rdata} when
+     * {@code en}, and written when {@code en} and {@code we}, read-first (the read returns the old word). Its write is
+     * also in {@link #writes()} (with enable {@code en & we}) and its read is {@code rdata}'s driver, so simulators and
+     * formal back ends need nothing new; the SystemVerilog emitter writes the port as one block, as FPGA tools expect.
+     */
+    public record Port(Expr addr, Expr en, Expr we, Expr data, Signal rdata, Write write) {}
+
+    private final List<Port> ports = new ArrayList<>();
+
+    /** The true dual-port ports (empty for an ordinary memory). */
+    public List<Port> ports() { return ports; }
+
     private String name;
     private final int width, depth, addrWidth;
     private final boolean signed;

@@ -32,7 +32,7 @@ public final class InOrderModel {
     Key<UInt> pcKey;
     int pcWidth;
     long pcReset, pcIncrement;
-    Mem<UInt> regFile;
+    RegisterFile regFile;
     final List<ReadPort> readPorts = new ArrayList<>();
     Key<UInt> rdKey;
     Key<Bool> writesKey;
@@ -44,6 +44,8 @@ public final class InOrderModel {
     Key<Bool> lane1OkKey, serializesKey, issueWritesKey;
     final List<Resolve> resolves = new ArrayList<>();
     Key<Bool> redirectKey, haltKey;
+    /** The decode-time "may write rd" (see {@link #mayWrite}); null: none. */
+    Key<Bool> mayWriteKey;
     Key<UInt> targetKey;
 
     private InOrderModel() {}
@@ -84,7 +86,15 @@ public final class InOrderModel {
 
     /** The register file. {@code zeroRegister}: index 0 reads as zero and never causes hazards. */
     public InOrderModel registerFile(Mem<UInt> mem, boolean zeroRegister) {
-        regFile = mem;
+        return registerFile(RegisterFile.of(mem), zeroRegister);
+    }
+
+    /**
+     * The register file as any implementation (for two lanes: a live-value table instead of a memory in registers).
+     * The generator only reads, writes and asks for its width.
+     */
+    public InOrderModel registerFile(RegisterFile rf, boolean zeroRegister) {
+        regFile = rf;
         this.zeroRegister = zeroRegister;
         return this;
     }
@@ -179,6 +189,64 @@ public final class InOrderModel {
         lane1OkKey = lane1Ok;
         serializesKey = serializes;
         issueWritesKey = writes;
+        return this;
+    }
+
+    /** A key whose resolving-item value the repair reads ({@link #speculative}). */
+    record Speculative(Key<? extends org.eninehq.tessera.core.Data> key, int width) {}
+
+    final List<Speculative> speculative = new ArrayList<>();
+    Consumer<Redirect> repair;
+
+    /**
+     * Speculative state: {@code key} ({@code width} bits, a {@link UInt} or, at width 1, a {@link Bool}) is carried with
+     * each item, and on a redirect the {@link #onRedirect repair} gets the resolving item's value of it. Typically a
+     * first-stage step puts a snapshot of a predictor register as it was before the item's fetch updated it (a global
+     * history, a return-stack pointer); keys produced later (the item's decoded kind) may be declared too, as long as
+     * every resolve point has them. In a dual-issue pipeline, a first-stage step gates its update of the state with
+     * {@link StepContext#fire()}, which in lane 1 is true only when that slot is kept (not dropped behind a guessed
+     * jump in slot 0, nor fetched again after a split).
+     */
+    public InOrderModel speculative(Key<? extends org.eninehq.tessera.core.Data> key, int width) {
+        if (width < 1) throw TesseraException.here("speculative " + key + ": width must be at least 1");
+        for (var s : speculative) if (s.key() == key) throw TesseraException.here("speculative " + key + " declared twice");
+        speculative.add(new Speculative(key, width));
+        return this;
+    }
+
+    /**
+     * The repair of speculative state, run once by the generator after all steps: it reads the redirect of the cycle
+     * ({@link Redirect}) and writes the model's registers. The generator's one hook for predictor state; what the
+     * state is and how it is repaired is model code.
+     */
+    public InOrderModel onRedirect(Consumer<Redirect> repair) {
+        if (this.repair != null) throw TesseraException.here("onRedirect(...) given twice");
+        this.repair = repair;
+        return this;
+    }
+
+    /**
+     * {@code writes}, produced at decode: the item may write its destination register. The in-order generator uses it
+     * for hazards in stages where {@link #writeRegs}'s condition is not produced yet (it is known only where the side
+     * effects are decided); the out-of-order generator renames with it.
+     */
+    public InOrderModel mayWrite(Key<Bool> writes) {
+        mayWriteKey = writes;
+        return this;
+    }
+
+    /** A pair the read stage does not issue together: lane 0's {@code older} and lane 1's {@code younger} both hold. */
+    record PairConflict(Key<Bool> older, Key<Bool> younger) {}
+
+    final List<PairConflict> pairConflicts = new ArrayList<>();
+
+    /**
+     * Issue rule for a two-lane schedule: the pair is split (the second instruction waits for the next cycle, in lane 0)
+     * when the first has {@code older} and the second has {@code younger}, both produced by the register-read stage.
+     * For units the lanes share in a way the generator does not know about, such as one memory written by both.
+     */
+    public InOrderModel splitPairWhen(Key<Bool> older, Key<Bool> younger) {
+        pairConflicts.add(new PairConflict(older, younger));
         return this;
     }
 

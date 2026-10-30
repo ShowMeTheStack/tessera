@@ -92,6 +92,16 @@ public interface Simulator extends AutoCloseable {
 
     void addListener(Listener l);
 
+    /** Called for each write to a memory as it commits at a clock edge: the cycle, the element index and its value (up to 64 bits). */
+    interface MemoryWriteListener {
+        void written(long cycle, long index, long value);
+    }
+
+    /** Observe every committed write to {@code mem}; no cost for memories nobody observes. */
+    default void addMemoryWriteListener(Mem<?> mem, MemoryWriteListener l) {
+        throw new UnsupportedOperationException("memory write listeners: " + getClass().getSimpleName());
+    }
+
     /**
      * Record a waveform of every named signal to {@code file}: FST when the name ends in
      * {@code .fst}, VCD otherwise. A {@code <file>.types.json} sidecar describes the Java types.

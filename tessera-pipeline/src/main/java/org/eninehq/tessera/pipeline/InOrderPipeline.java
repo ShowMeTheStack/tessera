@@ -46,6 +46,7 @@ public final class InOrderPipeline {
 
         p = Pipeline.begin(name, stopFetch.not());
         ctx.pipeline = p;
+        Repairs repairs = Repairs.of(m, p, name);
         ctx.step = "(pc)";
         ctx.put(m.pcKey, p.input(pcReg));
 
@@ -121,6 +122,7 @@ public final class InOrderPipeline {
                     resolveRedirect.get(ri).set(wrong);
                     resolveTarget.get(ri).set(next);
                     p.flush(wrong);
+                    if (repairs != null) repairs.record(ctx, ri, 0, ri, wrong, next);
                     ctx.step = "(resolve)";
                     ctx.put(believed.get(ri + 1), mux(known, next, was));
                     ctx.step = stepName;
@@ -149,19 +151,22 @@ public final class InOrderPipeline {
             Data latestValue = latest == null ? null : latest.value(), latestReady = latest == null ? null : latest.ready();
             for (var prod : producers) {
                 if (prod.stage() != st) continue;
-                prod.hit().set(ctx.<Bool>get(m.writesKey).and(p.valid()));
+                // before the write condition is known, the decode-time one (a conservative hazard; see mayWrite)
+                Bool writes = m.mayWriteKey != null && !ctx.has(m.writesKey) ? ctx.get(m.mayWriteKey) : ctx.get(m.writesKey);
+                prod.hit().set(writes.and(p.valid()));
                 prod.rd().set(ctx.get(m.rdKey));
                 if (latestValue != null) {
                     prod.value().set((UInt) latestValue);
                     prod.ready().set((Bool) latestReady);
                 } else {
-                    prod.value().set(UInt.lit(0, m.regFile.def().width()));
+                    prod.value().set(UInt.lit(0, m.regFile.width()));
                     prod.ready().set(Hw.FALSE);
                 }
                 report.add(describeProducer(s, prod.stage(), latestValue != null, m, st));
             }
         }
         when(p.valid().and(ctx.get(m.haltKey)), () -> halted.set(true));
+        if (repairs != null) repairs.finish();
         p.end();
     }
 
@@ -182,12 +187,12 @@ public final class InOrderPipeline {
         var producers = new ArrayList<Producer>();
         for (int j = readStage + 1; j <= writeStage; j++)
             producers.add(new Producer(j, p.late(Bool.TYPE), p.late(UInt.w(m.regFile.addrWidth())),
-                    p.late(UInt.w(m.regFile.def().width())), p.late(Bool.TYPE)));
+                    p.late(UInt.w(m.regFile.width())), p.late(Bool.TYPE)));
         Bool stall = Hw.FALSE;
         for (var port : m.readPorts) {
             UInt idx = ctx.get(port.index());
             UInt v = m.regFile.read(idx);
-            if (m.zeroRegister) v = mux(idx.eq(0), UInt.lit(0, m.regFile.def().width()), v);
+            if (m.zeroRegister) v = mux(idx.eq(0), UInt.lit(0, m.regFile.width()), v);
             Bool hazardFree = m.zeroRegister ? idx.ne(0) : Hw.TRUE;
             // youngest producer (closest stage) has priority: fold from oldest to youngest
             for (int k = producers.size() - 1; k >= 0; k--) {
@@ -255,6 +260,7 @@ public final class InOrderPipeline {
                         + ", before a halt takes effect in " + s.stageNames().get(halt)
                         + "; an item after the halt could commit");
         }
+        Repairs.validate(m, errs);
         if (!errs.isEmpty()) throw TesseraException.here("invalid schedule " + s + ":\n  " + String.join("\n  ", errs));
     }
 

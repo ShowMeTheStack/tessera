@@ -33,7 +33,7 @@ public final class XsctBus implements SocBus {
      */
     public XsctBus(String host, String dir, String image) {
         String docker = "sudo docker run --rm -i --privileged --net=host -v /dev/bus/usb:/dev/bus/usb"
-                + " -v $HOME/tessera-zed:/z -v $PWD:/w -w /w " + image
+                + " -v $HOME/tessera-builds:/z -v $PWD:/w -w /w " + image
                 + " bash -c 'source /opt/Xilinx/Vivado/2020.1/settings64.sh; export DISPLAY=:99;"
                 + " export PATH=/z/fakebin:/opt/Xilinx/Vitis/2020.1/bin:$PATH; exec xsct -interactive'";
         try {

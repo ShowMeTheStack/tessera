@@ -1,0 +1,23 @@
+Tessera
+Copyright (C) 2026 Jyotiprakash Mishra
+https://github.com/ShowMeTheStack/tessera
+
+Licensing
+
+Everything in this repository except the javac-fork directory is licensed under the GNU General
+Public License, version 3 (see LICENSE), with the additional term below.
+
+The javac-fork directory (tessera-javac.patch) modifies OpenJDK source files and is licensed under
+the GNU General Public License, version 2, with the Classpath Exception, the same terms as OpenJDK
+(see javac-fork/LICENSE).
+
+Additional term under section 7(b) of the GNU General Public License, version 3
+
+This term applies to all parts of Tessera that are licensed under GPLv3. You must preserve the
+following author attribution:
+
+    Tessera, by Jyotiprakash Mishra (https://github.com/ShowMeTheStack/tessera)
+
+in every copy of the source code you convey, in this NOTICE file, and in the Appropriate Legal
+Notices displayed by any work that contains Tessera or a work based on it. You may not remove or
+alter this attribution, or misrepresent the origin of the material.

@@ -4,6 +4,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -13,8 +14,19 @@ import org.eninehq.tessera.sim.Netlist;
 
 /**
  * Translates a flattened netlist into SMT-LIB 2 (QF_ABV), one copy of the combinational
- * logic per time step. All clock domains tick together (one global clock), as in
- * {@code Simulator.step()}; asynchronous resets are treated as synchronous.
+ * logic per time step.
+ *
+ * <p><b>Clocks.</b> A design with one clock domain ticks at every step, as in
+ * {@code Simulator.step()}. With several domains, every step has one free bit {@code k<t>_<d>}
+ * per domain, as in {@code Simulator.stepClocks}: a register, memory write port or property of
+ * domain {@code d} acts at step {@code t} only when that bit is 1; otherwise the register keeps
+ * its value. Nothing relates the domains unless {@link Formal} adds clock assumptions.
+ *
+ * <p><b>Asynchronous resets.</b> For a register with an asynchronous reset, the step's free or
+ * defined state is its stored value {@code q<t>_<slot>}; the value the logic sees,
+ * {@code s<t>_<slot>}, is the reset value whenever the reset is active, without waiting for an
+ * edge, and the reset value is stored, so it holds after release until the next edge (the
+ * simulator's {@code settle()}). Synchronous resets are applied at the edge, as before.
  */
 final class SmtUnroller {
     private static final OpKind[] KINDS = OpKind.values();
@@ -25,6 +37,16 @@ final class SmtUnroller {
     private final Map<Integer, Netlist.Insn> producer = new HashMap<>();
     private final long[] init;
     final boolean arbitraryMemory;
+    /** Registers with an asynchronous reset, by slot. */
+    private final Map<Integer, Netlist.Reg> asyncRegs = new LinkedHashMap<>();
+    /** Number of clock domains; more than one makes the ticks free. */
+    final int domains;
+    /**
+     * Definition order of instructions ({@link Netlist.Insn}) and visible values of
+     * asynchronous-reset registers ({@link Netlist.Reg}); null when there are no asynchronous resets
+     * (then it is the netlist's own instruction order).
+     */
+    private List<Object> order;
 
     /** Initial memory contents as constant arrays ({@code (as const ...)}); yices lacks them. */
     boolean constArrays = true;
@@ -36,6 +58,42 @@ final class SmtUnroller {
         inputSlots.addAll(net.inputSlots().values());
         for (var in : net.insns()) producer.put(in.dst(), in);
         this.init = net.initialValues();
+        for (var r : net.regs()) if (r.hasReset() && r.asyncReset()) asyncRegs.put(r.slot(), r);
+        this.domains = net.clockPaths().size();
+        if (!asyncRegs.isEmpty()) computeOrder();
+    }
+
+    /** True when the domains tick independently (more than one clock). */
+    boolean multiClock() {
+        return domains > 1;
+    }
+
+    boolean isAsync(int slot) {
+        return asyncRegs.containsKey(slot);
+    }
+
+    /** Topological order of the instructions and the asynchronous-reset registers' visible values. */
+    private void computeOrder() {
+        order = new ArrayList<>();
+        var done = new HashSet<Integer>();
+        var busy = new HashSet<Integer>();
+        for (var in : net.insns()) ensure(in.dst(), done, busy);
+        for (var r : asyncRegs.values()) ensure(r.slot(), done, busy);
+    }
+
+    private void ensure(int slot, Set<Integer> done, Set<Integer> busy) {
+        if (done.contains(slot)) return;
+        var r = asyncRegs.get(slot);
+        var in = r == null ? producer.get(slot) : null;
+        if (r == null && in == null) return;
+        if (!busy.add(slot))
+            throw new IllegalStateException("the asynchronous reset of register " + (r != null ? r.path() : "slot " + slot)
+                    + " depends combinationally on its own value; the formal back end does not support that");
+        if (r != null) ensure(r.resetSlot(), done, busy);
+        else for (int a : in.args()) ensure(a, done, busy);
+        busy.remove(slot);
+        done.add(slot);
+        order.add(r != null ? r : in);
     }
 
     static String bv(BigInteger v, int w) {
@@ -55,6 +113,37 @@ final class SmtUnroller {
         return "m" + t + "_" + m;
     }
 
+    /** The stored value of a register at step {@code t} (differs from the visible value only with an asynchronous reset). */
+    String stateName(int t, int slot) {
+        return asyncRegs.containsKey(slot) ? "q" + t + "_" + slot : name(t, slot);
+    }
+
+    /** The tick bit (width 1) of domain {@code d} at step {@code t}; only with several domains. */
+    String tickName(int t, int d) {
+        return "k" + t + "_" + d;
+    }
+
+    /** The condition that domain {@code d} has an edge at step {@code t}, or null when it always has one. */
+    String tick(int t, int d) {
+        return multiClock() ? "(= " + tickName(t, d) + " #b1)" : null;
+    }
+
+    /** {@code cond} gated by the tick of domain {@code d} at step {@code t}. */
+    String gated(int t, int d, String cond) {
+        String k = tick(t, d);
+        return k == null ? cond : "(and " + k + " " + cond + ")";
+    }
+
+    /** True at step {@code t} when property {@code ch} is checked: its domain ticks and it is enabled. */
+    String enabled(int t, Netlist.Check ch) {
+        return gated(t, ch.domain(), "(= " + term(t, ch.en(), 1) + " #b1)");
+    }
+
+    /** True when register {@code r}'s reset is active at step {@code t}. */
+    String resetActive(int t, Netlist.Reg r) {
+        return "(= " + term(t, r.resetSlot(), 1) + " " + bv(BigInteger.valueOf(r.resetActive()), 1) + ")";
+    }
+
     private int addrWidth(Netlist.Mem m) {
         return Math.max(1, 64 - Long.numberOfLeadingZeros(m.depth() - 1L));
     }
@@ -71,9 +160,11 @@ final class SmtUnroller {
             int slot = e.getValue();
             out.append("(declare-const ").append(name(t, slot)).append(' ').append(sort(net.slotWidth(slot))).append(")\n");
         }
+        if (multiClock())
+            for (int d = 0; d < domains; d++) out.append("(declare-const ").append(tickName(t, d)).append(" (_ BitVec 1))\n");
         if (t == 0 || freeState) {
             for (var r : net.regs())
-                out.append("(declare-const ").append(name(t, r.slot())).append(' ').append(sort(r.width())).append(")\n");
+                out.append("(declare-const ").append(stateName(t, r.slot())).append(' ').append(sort(r.width())).append(")\n");
             for (int m = 0; m < net.mems().size(); m++) {
                 var mem = net.mems().get(m);
                 String arr = "(Array " + sort(addrWidth(mem)) + " " + sort(mem.width()) + ")";
@@ -106,9 +197,26 @@ final class SmtUnroller {
                 continue;
             out.append("(declare-const ").append(name(t, slot)).append(' ').append(sort(w)).append(")\n");
         }
-        for (var in : net.insns())
-            out.append("(define-fun ").append(name(t, in.dst())).append(" () ").append(sort(in.width())).append(' ')
-                    .append(expr(t, in)).append(")\n");
+        if (order == null) {
+            for (var in : net.insns()) defineInsn(out, t, in);
+            return;
+        }
+        for (var o : order) {
+            if (o instanceof Netlist.Insn in) {
+                defineInsn(out, t, in);
+            } else {
+                // an asynchronous reset overrides the stored value at once
+                var r = (Netlist.Reg) o;
+                out.append("(define-fun ").append(name(t, r.slot())).append(" () ").append(sort(r.width())).append(" (ite ")
+                        .append(resetActive(t, r)).append(' ').append(bv(BitVec.toBig(r.resetWords(), 0, r.width()), r.width()))
+                        .append(' ').append(stateName(t, r.slot())).append("))\n");
+            }
+        }
+    }
+
+    private void defineInsn(StringBuilder out, int t, Netlist.Insn in) {
+        out.append("(define-fun ").append(name(t, in.dst())).append(" () ").append(sort(in.width())).append(' ')
+                .append(expr(t, in)).append(")\n");
     }
 
     static BigInteger mask(int w) {
@@ -120,12 +228,12 @@ final class SmtUnroller {
         for (var r : net.regs()) {
             String next = term(t, r.next(), r.width());
             String v = next;
-            if (r.hasReset()) {
-                String rst = term(t, r.resetSlot(), 1);
-                String active = "(= " + rst + " " + bv(BigInteger.valueOf(r.resetActive()), 1) + ")";
-                v = "(ite " + active + " " + bv(BitVec.toBig(r.resetWords(), 0, r.width()), r.width()) + " " + next + ")";
-            }
-            out.append("(define-fun ").append(name(t + 1, r.slot())).append(" () ").append(sort(r.width())).append(' ')
+            if (r.hasReset())
+                v = "(ite " + resetActive(t, r) + " " + bv(BitVec.toBig(r.resetWords(), 0, r.width()), r.width()) + " " + next + ")";
+            // no edge: keep the value (the visible one, so that a reset applied asynchronously stays)
+            String k = tick(t, r.domain());
+            if (k != null) v = "(ite " + k + " " + v + " " + term(t, r.slot(), r.width()) + ")";
+            out.append("(define-fun ").append(stateName(t + 1, r.slot())).append(" () ").append(sort(r.width())).append(' ')
                     .append(v).append(")\n");
         }
         for (int m = 0; m < net.mems().size(); m++) {
@@ -138,7 +246,7 @@ final class SmtUnroller {
                 int awIn = net.slotWidth(w.addr());
                 String addr = fitAddr(term(t, w.addr(), awIn), awIn, aw);
                 String inRange = inRange(term(t, w.addr(), awIn), awIn, mem.depth());
-                String en = "(and (= " + term(t, w.en(), 1) + " #b1) " + inRange + ")";
+                String en = gated(t, w.domain(), "(and (= " + term(t, w.en(), 1) + " #b1) " + inRange + ")");
                 v = "(ite " + en + " (store " + v + " " + addr + " " + term(t, w.data(), mem.width()) + ") " + v + ")";
             }
             out.append("(define-fun ").append(memName(t + 1, m)).append(" () ").append(arr).append(' ').append(v).append(")\n");
@@ -242,6 +350,13 @@ final class SmtUnroller {
                 yield acc;
             }
         };
+    }
+
+    /** Tick names of step {@code t}, in domain order (empty with one domain). */
+    List<String> tickNames(int t) {
+        var out = new ArrayList<String>();
+        if (multiClock()) for (int d = 0; d < domains; d++) out.add(tickName(t, d));
+        return out;
     }
 
     List<String> inputNames(int t) {

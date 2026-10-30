@@ -54,7 +54,7 @@ final class Fpga {
 
     private final List<Path> sources;
     private final String host = System.getenv().getOrDefault("ZED_HOST", "user@zed-host");
-    private final String dir = System.getenv().getOrDefault("ZED_DIR", "tessera-zed") + "/studio";
+    private final String dir = System.getenv().getOrDefault("ZED_DIR", "tessera-builds") + "/studio";
     private final Map<Integer, Job> jobs = new ConcurrentHashMap<>();
     private final AtomicInteger next = new AtomicInteger(1);
 
@@ -242,7 +242,7 @@ final class Fpga {
             if (!program) return;
             job.say("Programming the board over JTAG…");
             // as XsctBus does: xsct asks for xlsclients, which a stub in the host's fakebin answers
-            sh(job, List.of("ssh", host, "cd " + dir + " && sudo docker run --rm --privileged --net=host -v /dev/bus/usb:/dev/bus/usb -v $HOME/tessera-zed:/z -v $PWD:/w -w /w " + IMG
+            sh(job, List.of("ssh", host, "cd " + dir + " && sudo docker run --rm --privileged --net=host -v /dev/bus/usb:/dev/bus/usb -v $HOME/tessera-builds:/z -v $PWD:/w -w /w " + IMG
                     + " bash -c '" + VIV + "; export PATH=/z/fakebin:/opt/Xilinx/Vitis/2020.1/bin:$PATH; xsct program.tcl'"));
             boolean done;
             synchronized (job.log) { done = job.log.stream().anyMatch(l -> l.startsWith("TESSERA_PROGRAMMED")); }
